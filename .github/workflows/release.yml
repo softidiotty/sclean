@@ -1,0 +1,49 @@
+name: Build and release sclean.exe
+
+# Срабатывает при пуше тега вида v1.9.1 (обязательно с буквой v впереди,
+# число должно совпадать с APP_VERSION в sclean.py — это то, что программа
+# сравнивает при проверке обновлений). Сборка идёт на предоставляемом
+# GitHub бесплатном Windows-раннере, PyInstaller устанавливать локально
+# не нужно.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Нужно явное разрешение на запись, иначе action-gh-release не сможет
+# создать релиз и прикрепить к нему файл.
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build sclean.exe
+        run: pyinstaller sclean.spec
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/sclean.exe")) {
+            Write-Error "dist/sclean.exe не найден после сборки"
+            exit 1
+          }
+          Get-Item "dist/sclean.exe" | Select-Object Name, Length
+
+      - name: Create GitHub Release and upload sclean.exe
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/sclean.exe
+          generate_release_notes: true
