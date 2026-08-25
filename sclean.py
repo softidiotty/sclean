@@ -17,7 +17,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.9.6"
+APP_VERSION = "1.9.7"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -2330,7 +2330,21 @@ class CleanerApp:
             return
         self.cancel_requested = True
         self.cancel_btn.configure(state="disabled")
-        self.status_label.configure(text="Отмена запрошена — завершится после текущего шага...")
+
+        # "Очистка диска" (cleanmgr) выполняется в отдельном фоновом
+        # потоке параллельно с остальными пунктами (см. _worker) и не
+        # проверяет cancel_requested — только cleanmgr_stop_flag. Без
+        # этого нажатие "Отмена" останавливало бы только ещё не начатые
+        # обычные пункты, а cleanmgr продолжал бы молча работать в фоне,
+        # как будто отмена его не касается.
+        if self.cleanmgr_pid is not None:
+            self.cleanmgr_stop_flag["stop"] = True
+            _kill_processes_by_name("cleanmgr.exe")
+            self.kill_cleanmgr_btn.pack_forget()
+            self.cleanmgr_pid = None
+            self.status_label.configure(text="Отмена запрошена — очистка диска остановлена, завершаем оставшееся...")
+        else:
+            self.status_label.configure(text="Отмена запрошена — завершится после текущего шага...")
 
     def _worker(self, steps_to_run):
         def logf(msg):
