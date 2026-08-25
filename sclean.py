@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.13.3"
+APP_VERSION = "1.14.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -375,6 +375,34 @@ def format_bytes_gb(num_bytes):
     return round(num_bytes / (1024 ** 3), 2)
 
 
+def report_freed_bytes(logf, num_bytes):
+    """
+    Способ для шага сообщить, сколько байт он РЕАЛЬНО освободил.
+
+    Раньше итог "Освобождено места" считался как разница свободного
+    места на C: до и после всего запуска. Это регулярно врало: за
+    десятки секунд работы система и другие программы успевают записать
+    на диск больше, чем очистка освободила, и в отчёт попадали значения
+    вроде "-0.01 ГБ" — при том что очистка временных файлов честно
+    освободила 0.04 ГБ и написала об этом строкой выше.
+
+    Теперь шаги, которые знают свой объём точно (они удаляют файлы сами
+    и складывают размеры), сообщают его сюда, а итог считается суммой
+    этих значений. Величина не может стать отрицательной и не зависит от
+    посторонней записи на диск. Разница свободного места по-прежнему
+    показывается в отчёте, но как справочная, с оговоркой.
+
+    Значение копится прямо на объекте функции logf — у каждого шага она
+    своя (см. CleanerApp._worker._make_logf), так что счётчики шагов не
+    смешиваются. Для logf без поддержки атрибутов вызов просто ничего не
+    делает.
+    """
+    try:
+        logf.freed_bytes = getattr(logf, "freed_bytes", 0) + int(num_bytes)
+    except Exception:
+        pass
+
+
 def get_disk_media_type(drive_letter="C"):
     ps = (
         f"$p = Get-Partition -DriveLetter {drive_letter} -ErrorAction Stop; "
@@ -497,11 +525,44 @@ def backup_power_plan(logf):
         "[0-9a-fA-F]{4}-[0-9a-fA-F]{12}').Value"
     )
     guid = (out or "").strip().splitlines()[-1].strip() if (out or "").strip() else ""
+
+    # Тайм-ауты сна/экрана/дисков и USB selective suspend сохраняем
+    # отдельно: step_power_plan обнуляет их, и без этих значений откат
+    # вернул бы прежнюю СХЕМУ, но с уже затёртыми тайм-аутами.
+    # powercfg /query печатает их в шестнадцатеричном виде — забираем
+    # оба индекса (от сети и от батареи) по каждому параметру.
+    timeouts = {}
+    for label, subgroup, setting in (
+        ("standby", "SUB_SLEEP", "STANDBYIDLE"),
+        ("monitor", "SUB_VIDEO", "VIDEOIDLE"),
+        ("disk", "SUB_DISK", "DISKIDLE"),
+        ("usb_suspend", "2a737441-1930-4402-8d77-b2bebba308a3", "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"),
+    ):
+        q = run_ps(
+            f"$t = (powercfg /query SCHEME_CURRENT {subgroup} {setting} | Out-String); "
+            "$ac = [regex]::Match($t, '(?i)Current AC Power Setting Index:\\s*0x([0-9a-f]+)').Groups[1].Value; "
+            "if (-not $ac) { $ac = [regex]::Match($t, '0x([0-9a-f]+)').Groups[1].Value }; "
+            "$dc = [regex]::Match($t, '(?i)Current DC Power Setting Index:\\s*0x([0-9a-f]+)').Groups[1].Value; "
+            "Write-Output ($ac + '|' + $dc)",
+            timeout=30,
+        )
+        parts = (q or "").strip().splitlines()
+        if parts:
+            ac, _, dc = parts[-1].strip().partition("|")
+            if ac or dc:
+                timeouts[label] = {"ac": ac.strip(), "dc": dc.strip()}
+
+    payload = {"power_timeouts": timeouts}
     if guid:
-        save_backup({"power_plan_guid": guid})
+        payload["power_plan_guid"] = guid
+    save_backup(payload)
+
+    if guid:
         logf(f"  Бэкап: текущая схема электропитания сохранена ({guid}).")
     else:
         logf("  Бэкап: не удалось определить текущую схему электропитания.")
+    if timeouts:
+        logf(f"  Бэкап: сохранены прежние тайм-ауты сна/экрана/дисков и USB ({len(timeouts)} параметра).")
 
 
 def backup_firewall(logf):
@@ -613,6 +674,54 @@ def backup_prefetch_snapshot(logf):
         pass
 
 
+def backup_usb_power(logf):
+    """
+    Сохраняет состояние галочек "Разрешить отключение этого устройства
+    для экономии энергии" по каждому USB-устройству плюс машинный
+    переключатель Services\\USB\\DisableSelectiveSuspend.
+
+    Без этого бэкапа кнопка "Бэкап" обещала вернуть систему в прежнее
+    состояние, но пункт отключения энергосбережения USB откатить было
+    нечем — он менял настройки безвозвратно.
+
+    Ключ словаря — имя экземпляра WMI (InstanceName), значение — было ли
+    разрешено отключение (True/False). Восстановление возвращает ровно
+    те значения, что были у каждого устройства, а не "включить всем".
+    """
+    ps = (
+        "$out = @(); "
+        "try { "
+        "  foreach ($it in @(Get-CimInstance -Namespace root/WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop)) { "
+        "    if ($it.InstanceName) { $out += ($it.InstanceName + '=' + $it.Enable) } "
+        "  } "
+        "} catch {}; "
+        "$out -join [Environment]::NewLine"
+    )
+    out = run_ps(ps, timeout=90)
+    states = {}
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        name, _, value = line.rpartition("=")
+        value = value.strip().lower()
+        if name and value in ("true", "false"):
+            states[name.strip()] = (value == "true")
+
+    global_out = run_ps(
+        "try { (Get-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\USB' "
+        "-Name 'DisableSelectiveSuspend' -ErrorAction Stop).DisableSelectiveSuspend } catch { 'NONE' }",
+        timeout=30,
+    )
+    global_val = (global_out or "").strip().splitlines()[-1].strip() if (global_out or "").strip() else "NONE"
+
+    save_backup({
+        "usb_power_states": states,
+        "usb_disable_selective_suspend": global_val,
+    })
+    logf(f"  Бэкап: состояние энергосбережения сохранено для {len(states)} USB-устройств.")
+
+
 def backup_services(logf, service_names):
     """
     Сохраняет текущий тип запуска (StartType) перечисленных служб перед
@@ -644,7 +753,7 @@ def backup_startup_apps(logf, disabled_entries):
 
 # Категории бэкапа, доступные для точечного восстановления (используется
 # и диалогом "Бэкап", и полным restore_from_backup).
-BACKUP_CATEGORIES = ("power_plan", "firewall", "visual_effects", "services", "startup_apps")
+BACKUP_CATEGORIES = ("power_plan", "firewall", "visual_effects", "services", "startup_apps", "usb_power")
 
 
 def restore_from_backup(logf, categories=None):
@@ -674,6 +783,87 @@ def restore_from_backup(logf, categories=None):
             logf(f"  Электропитание: восстановлена схема {guid} (код {code}).")
         else:
             logf("  Электропитание: в бэкапе нет сохранённой схемы.")
+
+        # Тайм-ауты возвращаем отдельно: смена схемы не восстанавливает
+        # значения, которые step_power_plan обнулил внутри самой схемы.
+        timeouts = data.get("power_timeouts") or {}
+        restored_timeouts = 0
+        setting_map = {
+            "standby": ("SUB_SLEEP", "STANDBYIDLE"),
+            "monitor": ("SUB_VIDEO", "VIDEOIDLE"),
+            "disk": ("SUB_DISK", "DISKIDLE"),
+            "usb_suspend": (
+                "2a737441-1930-4402-8d77-b2bebba308a3",
+                "48e6b7a6-50f5-4782-a5d4-53bb8f07e226",
+            ),
+        }
+        for label, values in timeouts.items():
+            if label not in setting_map or not isinstance(values, dict):
+                continue
+            subgroup, setting = setting_map[label]
+            for kind, flag in (("ac", "/setacvalueindex"), ("dc", "/setdcvalueindex")):
+                raw = (values.get(kind) or "").strip()
+                if not raw:
+                    continue
+                try:
+                    value = int(raw, 16)
+                except ValueError:
+                    continue
+                code, _, _ = run_cmd(
+                    f"powercfg {flag} SCHEME_CURRENT {subgroup} {setting} {value}", timeout=15
+                )
+                if code == 0:
+                    restored_timeouts += 1
+        if restored_timeouts:
+            run_cmd("powercfg /setactive SCHEME_CURRENT", timeout=15)
+            logf(f"  Электропитание: восстановлено прежних тайм-аутов: {restored_timeouts}.")
+        elif timeouts:
+            logf("  Электропитание: тайм-ауты в бэкапе есть, но применить их не удалось.")
+
+    if "usb_power" in categories:
+        usb_states = data.get("usb_power_states") or {}
+        if usb_states:
+            # Возвращаем ровно то значение, что было у каждого
+            # устройства: у части галочка могла быть снята и до запуска
+            # программы, и "включить всем" исказило бы исходное состояние.
+            pairs = "; ".join(
+                "@{{N='{0}';V=${1}}}".format(name.replace("'", "''"), "true" if enabled else "false")
+                for name, enabled in usb_states.items()
+            )
+            ps = (
+                f"$want = @({pairs}); "
+                "$map = @{}; foreach ($p in $want) { $map[$p.N] = $p.V }; "
+                "$done = 0; "
+                "try { "
+                "  foreach ($it in @(Get-CimInstance -Namespace root/WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop)) { "
+                "    if ($map.ContainsKey($it.InstanceName)) { "
+                "      try { $it.Enable = $map[$it.InstanceName]; Set-CimInstance -InputObject $it -ErrorAction Stop; $done++ } catch {} "
+                "    } "
+                "  } "
+                "} catch {}; "
+                "Write-Output $done"
+            )
+            out = run_ps(ps, timeout=120)
+            done = (out or "").strip().splitlines()[-1].strip() if (out or "").strip() else "0"
+            logf(f"  USB: восстановлено состояние энергосбережения для {done} из {len(usb_states)} устройств.")
+        else:
+            logf("  USB: в бэкапе нет сохранённого состояния устройств.")
+
+        global_val = (data.get("usb_disable_selective_suspend") or "").strip()
+        if global_val and global_val != "NONE":
+            run_ps(
+                "Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\USB' "
+                f"-Name 'DisableSelectiveSuspend' -Value {global_val} -Type DWord -ErrorAction SilentlyContinue",
+                timeout=30,
+            )
+            logf(f"  USB: DisableSelectiveSuspend возвращён в прежнее значение ({global_val}).")
+        elif global_val == "NONE":
+            run_ps(
+                "Remove-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\USB' "
+                "-Name 'DisableSelectiveSuspend' -ErrorAction SilentlyContinue",
+                timeout=30,
+            )
+            logf("  USB: DisableSelectiveSuspend удалён (до запуска его не было).")
 
     if "firewall" in categories:
         fw_states = data.get("firewall_state")
@@ -823,16 +1013,40 @@ def step_clean_temp(logf):
     run_cmd("net start wuauserv", timeout=30)
     logf("Служба wuauserv запущена обратно.")
     logf(f"  Итого освобождено временными файлами: {format_bytes_gb(total_freed)} ГБ")
+    report_freed_bytes(logf, total_freed)
 
 
 def step_recycle_bin(logf):
     logf("Очистка корзины...")
+
+    # Объём корзины замеряем ДО очистки: Clear-RecycleBin не сообщает,
+    # сколько освободила, а без этого пункт не попадал бы в итог
+    # "Освобождено места" вообще (см. report_freed_bytes).
+    size_out = run_ps(
+        "$s = 0; "
+        "Get-ChildItem -LiteralPath 'C:\\$Recycle.Bin' -Recurse -Force -ErrorAction SilentlyContinue | "
+        "ForEach-Object { if (-not $_.PSIsContainer) { $s += $_.Length } }; "
+        "Write-Output $s",
+        timeout=60,
+    )
+    try:
+        size_before = int((size_out or "0").strip().splitlines()[-1].strip())
+    except (ValueError, IndexError):
+        size_before = 0
+
     out = run_ps(
         "try { Clear-RecycleBin -Confirm:$false -ErrorAction Stop; Write-Output OK } "
         "catch { Write-Output $_.Exception.Message }",
         timeout=60,
     )
-    logf(f"  Результат: {(out or 'нет ответа').strip()}")
+    result = (out or "нет ответа").strip()
+    logf(f"  Результат: {result}")
+    if size_before > 0:
+        logf(f"  Освобождено очисткой корзины: {format_bytes_gb(size_before)} ГБ")
+        if result == "OK":
+            report_freed_bytes(logf, size_before)
+    else:
+        logf("  Корзина была пуста.")
 
 
 # Два независимых профиля очистки диска (номера произвольные, использует
@@ -1397,6 +1611,7 @@ def step_usb_power_management(logf):
     именно суммарный эффект.
     """
     logf("Отключение энергосбережения USB-портов...")
+    backup_usb_power(logf)
 
     # 1. Галочка "Разрешить отключение этого устройства для экономии
     # энергии" — через WMI. Это основной способ; всё остальное ниже
@@ -1506,6 +1721,147 @@ def step_usb_power_management(logf):
     if not wmi_ok:
         logf("  Внимание: основной способ (WMI) не сработал — галочка в диспетчере")
         logf("  устройств могла остаться отмеченной, хотя запрет на уровне системы записан.")
+
+
+def step_hardware_check(logf):
+    """
+    Диагностика железа и периферии: ничего не меняет, только собирает
+    состояние и подсвечивает проблемы. Смысл пункта — на удалённом
+    моноблоке одним запуском увидеть то, ради чего обычно лезут в три
+    разных окна: не сыплется ли диск, не кончается ли место, все ли
+    устройства поднялись без ошибок и вся ли периферия на месте.
+
+    Возвращает текст для отчёта (returns_text=True в STEPS), поэтому
+    подробности попадают и в файл, и в построчную детализацию пункта.
+    """
+    logf("Диагностика железа и периферии...")
+    lines = ["[Диагностика железа и периферии]"]
+    problems = []
+
+    # --- Диски: здоровье, тип, температура ---
+    disk_ps = (
+        "foreach ($d in @(Get-PhysicalDisk -ErrorAction SilentlyContinue)) { "
+        "  $t = ''; "
+        "  try { $t = (Get-StorageReliabilityCounter -PhysicalDisk $d -ErrorAction Stop).Temperature } catch {}; "
+        "  Write-Output ($d.FriendlyName + '|' + $d.HealthStatus + '|' + $d.MediaType + '|' + "
+        "                [math]::Round($d.Size / 1GB) + '|' + $t) "
+        "}"
+    )
+    disk_out = run_ps(disk_ps, timeout=90)
+    any_disk = False
+    for line in (disk_out or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 4 or not parts[0].strip():
+            continue
+        any_disk = True
+        name, health, media, size = (p.strip() for p in parts[:4])
+        temp = parts[4].strip() if len(parts) > 4 else ""
+        extra = f", {temp} °C" if temp else ""
+        lines.append(f"Диск: {name} — {size} ГБ, {media or 'тип неизвестен'}, состояние: {health}{extra}")
+        logf(f"  Диск {name}: {health}, {size} ГБ{extra}")
+        if health and health.lower() not in ("healthy", "работоспособен", "исправен"):
+            problems.append(f"диск {name} сообщает о состоянии «{health}» — стоит проверить и заранее заменить")
+        try:
+            if temp and int(float(temp)) >= 60:
+                problems.append(f"диск {name} горячий ({temp} °C) — проверьте охлаждение и запылённость")
+        except ValueError:
+            pass
+    if not any_disk:
+        lines.append("Диски: получить сведения не удалось.")
+        logf("  Диски: получить сведения не удалось.")
+
+    # --- Свободное место по всем разделам ---
+    vol_ps = (
+        "foreach ($v in @(Get-Volume -ErrorAction SilentlyContinue | "
+        "  Where-Object { $_.DriveLetter -and $_.Size -gt 0 })) { "
+        "  Write-Output ($v.DriveLetter + '|' + [math]::Round($v.Size / 1GB, 1) + '|' + "
+        "                [math]::Round($v.SizeRemaining / 1GB, 1)) "
+        "}"
+    )
+    vol_out = run_ps(vol_ps, timeout=60)
+    for line in (vol_out or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3 or not parts[0].strip():
+            continue
+        letter, total_s, free_s = (p.strip().replace(",", ".") for p in parts)
+        try:
+            total_v, free_v = float(total_s), float(free_s)
+        except ValueError:
+            continue
+        pct_free = (free_v / total_v * 100) if total_v else 0
+        lines.append(f"Раздел {letter}: свободно {free_v} из {total_v} ГБ ({pct_free:.0f}%)")
+        logf(f"  Раздел {letter}: свободно {free_v} / {total_v} ГБ ({pct_free:.0f}%)")
+        if pct_free < 10:
+            problems.append(
+                f"на разделе {letter}: осталось {pct_free:.0f}% свободного места — "
+                "Windows начнёт тормозить и может не установить обновления"
+            )
+
+    # --- Устройства с ошибками в диспетчере устройств ---
+    err_ps = (
+        "foreach ($d in @(Get-PnpDevice -ErrorAction SilentlyContinue | "
+        "  Where-Object { $_.Status -ne 'OK' -and $_.Status -ne 'Unknown' -and $_.Present })) { "
+        "  Write-Output ($d.FriendlyName + '|' + $d.Status + '|' + $d.Class) "
+        "}"
+    )
+    err_out = run_ps(err_ps, timeout=90)
+    bad_devices = [l.strip() for l in (err_out or "").splitlines() if l.strip() and "|" in l]
+    if bad_devices:
+        lines.append(f"Устройства с ошибками: {len(bad_devices)}")
+        logf(f"  Устройств с ошибками в диспетчере: {len(bad_devices)}")
+        for entry in bad_devices[:15]:
+            name, _, rest = entry.partition("|")
+            status, _, cls = rest.partition("|")
+            lines.append(f"  - {name.strip()} ({cls.strip() or 'без класса'}): {status.strip()}")
+            logf(f"    - {name.strip()}: {status.strip()}")
+        problems.append(
+            f"в диспетчере устройств {len(bad_devices)} устройств(а) с ошибкой — "
+            "обычно не встал драйвер"
+        )
+    else:
+        lines.append("Устройства с ошибками: нет.")
+        logf("  Устройств с ошибками в диспетчере нет.")
+
+    # --- Подключённая USB-периферия ---
+    usb_ps = (
+        "foreach ($d in @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
+        "  Where-Object { $_.InstanceId -like 'USB*' -and $_.Class -notin @('USB') })) { "
+        "  Write-Output ($d.FriendlyName + '|' + $d.Class) "
+        "}"
+    )
+    usb_out = run_ps(usb_ps, timeout=90)
+    peripherals = []
+    for line in (usb_out or "").splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        name, _, cls = line.partition("|")
+        name = name.strip()
+        if name:
+            peripherals.append(f"{name} ({cls.strip() or 'без класса'})")
+    if peripherals:
+        lines.append(f"Подключённая USB-периферия ({len(peripherals)}):")
+        logf(f"  Подключённая USB-периферия: {len(peripherals)} устройств.")
+        for item in peripherals[:25]:
+            lines.append(f"  - {item}")
+    else:
+        lines.append("Подключённая USB-периферия: не обнаружена.")
+        logf("  USB-периферия не обнаружена.")
+
+    # --- Итог ---
+    if problems:
+        lines.append("")
+        lines.append("Требует внимания:")
+        logf(f"  Найдено проблем: {len(problems)}.")
+        for p in problems:
+            lines.append(f"  ! {p}")
+            logf(f"    ! {p}")
+    else:
+        lines.append("")
+        lines.append("Проблем не обнаружено.")
+        logf("  Проблем не обнаружено.")
+
+    return "\n".join(lines)
 
 
 def _find_speedtest_cli():
@@ -1724,6 +2080,12 @@ STEPS = [
      "сами по себе. Важно для сканеров штрихкодов, чековых принтеров и другой\n"
      "периферии на моноблоках/планшетах, которая иначе может периодически отваливаться.",
      True, False, 10),
+    ("hardware_check", "Диагностика железа и периферии", step_hardware_check, True,
+     "Ничего не меняет — только проверяет и пишет результат в отчёт: состояние (SMART)\n"
+     "и температуру дисков, свободное место по всем разделам, устройства с ошибками\n"
+     "в диспетчере устройств и список подключённой USB-периферии.\n"
+     "Проблемы выносятся отдельным списком «Требует внимания».",
+     True, False, 30),
     ("internet_speed", "Проверка скорости интернет-соединения", step_internet_speed, True,
      "Измеряет скорость скачивания через Speedtest CLI (если найден) или резервным\n"
      "способом — скачиванием тестового файла.",
@@ -1747,6 +2109,7 @@ STEP_ICONS = {
     "restore_points": "📍",
     "cleanmgr_deep": "📦",
     "usb_power": "🔌",
+    "hardware_check": "🩺",
     "internet_speed": "🌐",
 }
 
@@ -2160,6 +2523,15 @@ class StepRow(tk.Frame):
             self.expand_btn.pack(side="right", padx=(6, 10), pady=2)
             self.expand_btn.bind("<Button-1>", lambda e: on_toggle_expand())
 
+            # Подсветка при наведении — без неё кнопка выглядела как
+            # обычная подпись, и было неочевидно, что на неё можно
+            # нажать (курсор-рука появляется только прямо над текстом).
+            # Пока панель раскрыта, цвет задан в _draw() и наведение его
+            # не трогает, чтобы не спорить с индикацией "панель открыта".
+            self.expand_btn.bind("<Enter>", self._on_expand_hover_in)
+            self.expand_btn.bind("<Leave>", self._on_expand_hover_out)
+            Tooltip(self.expand_btn, "Показать список служб и включить/отключить каждую по отдельности")
+
         tooltip_targets = [self, self.box_canvas, self.label]
         if self.eta_label is not None:
             tooltip_targets.append(self.eta_label)
@@ -2172,6 +2544,17 @@ class StepRow(tk.Frame):
 
     def _toggle(self, _event=None):
         self.variable.set(not self.variable.get())
+        self._draw()
+
+    def _on_expand_hover_in(self, _event=None):
+        if self.expand_btn is None or self.expanded:
+            return
+        self.expand_btn.configure(bg=DARK_BG_ALT, fg=DARK_ETA_WARN)
+
+    def _on_expand_hover_out(self, _event=None):
+        if self.expand_btn is None or self.expanded:
+            return
+        # Возвращаем цвет, соответствующий текущему состоянию строки.
         self._draw()
 
     def set_expand_arrow(self, expanded):
@@ -2492,13 +2875,46 @@ class CleanerApp:
         # отдельный пункт списка "Сбор информации о системе", теперь
         # показывается сразу в шапке при запуске. Опрос идёт в фоновом
         # потоке (Get-CimInstance занимает 1-3 сек), чтобы не морозить GUI.
+        # Текст сводки лежит в tk.Text, а не в ttk.Label, именно чтобы
+        # его можно было выделить мышью и скопировать (Ctrl+C) — из
+        # Label текст скопировать невозможно в принципе, а сведения о
+        # системе как раз обычно нужно куда-то переслать. Виджет
+        # настроен так, чтобы визуально не отличаться от обычной
+        # подписи: без рамки, с фоном блока, невысокий, без курсора
+        # ввода. Правка запрещена не через state="disabled" (это
+        # блокирует и выделение), а перехватом нажатий клавиш.
         system_summary_row = ttk.Frame(block1)
         system_summary_row.pack(fill="x", padx=8, pady=(4, 6))
-        self.system_summary_label = ttk.Label(
-            system_summary_row, text="Сведения о системе: загрузка…",
-            style="Dim.TLabel", font=(APP_FONT, 8), wraplength=520, justify="left",
+        self.system_summary_text = tk.Text(
+            system_summary_row, height=2, wrap="word", font=(APP_FONT, 8),
+            bg=DARK_BG, fg=DARK_FG_DIM, relief="flat", bd=0, highlightthickness=0,
+            insertwidth=0, cursor="xterm", padx=0, pady=0,
+            selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
         )
-        self.system_summary_label.pack(side="left", fill="x")
+        self.system_summary_text.insert("1.0", "Сведения о системе: загрузка…")
+        self.system_summary_text.pack(side="left", fill="x", expand=True)
+
+        def _summary_keypress(event):
+            # Пропускаем только копирование и выделение всего текста,
+            # остальные нажатия игнорируем — получается поле, доступное
+            # только для чтения, но с рабочим выделением.
+            if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
+                return None
+            if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"):
+                return None
+            return "break"
+
+        self.system_summary_text.bind("<Key>", _summary_keypress)
+        self.system_summary_text.bind("<Control-a>", lambda e: (
+            self.system_summary_text.tag_add("sel", "1.0", "end-1c"), "break")[1])
+        Tooltip(self.system_summary_text, "Текст можно выделить мышью и скопировать (Ctrl+C)")
+
+        self.copy_summary_btn = ttk.Button(
+            system_summary_row, text="Копировать", width=12, command=self._copy_system_summary,
+        )
+        self.copy_summary_btn.pack(side="right", padx=(6, 0))
+        Tooltip(self.copy_summary_btn, "Скопировать сведения о системе в буфер обмена")
+
         threading.Thread(target=self._load_system_summary_async, daemon=True).start()
 
         # Сворачиваемое краткое описание программы: что делает и где
@@ -2828,7 +3244,34 @@ class CleanerApp:
             f"🖥 {summary['os']} (сборка {summary['build']})   ·   ⚙ {summary['cpu']}   ·   "
             f"🧠 {summary['ram']}   ·   🔧 {summary['board']}"
         )
-        self.root.after(0, lambda: self.system_summary_label.configure(text=text))
+        self.root.after(0, lambda: self._set_system_summary_text(text))
+
+    def _set_system_summary_text(self, text):
+        """
+        Заменяет текст в поле сводки. Поле только для чтения за счёт
+        перехвата клавиш, а не state="disabled", поэтому вставлять текст
+        можно напрямую, без временного разблокирования.
+        """
+        self.system_summary_text.delete("1.0", "end")
+        self.system_summary_text.insert("1.0", text)
+
+    def _copy_system_summary(self):
+        """
+        Кладёт сводку о системе в буфер обмена целиком — быстрее, чем
+        выделять мышью, когда нужно просто переслать характеристики.
+        """
+        text = self.system_summary_text.get("1.0", "end-1c").strip()
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            return
+        # Короткая обратная связь на самой кнопке — окно с сообщением
+        # ради копирования строки было бы избыточным.
+        self.copy_summary_btn.configure(text="Скопировано")
+        self.root.after(1200, lambda: self.copy_summary_btn.configure(text="Копировать"))
 
     def _toggle_services_panel(self, steps_frame):
         """
@@ -3218,14 +3661,16 @@ class CleanerApp:
             "visual_effects": "Визуальные эффекты",
             "services": "Службы Windows",
             "startup_apps": "Автозапуск приложений",
+            "usb_power": "Энергосбережение USB-портов",
         }
         availability = {
-            "power_plan": bool(backup.get("power_plan_guid")),
+            "power_plan": bool(backup.get("power_plan_guid") or backup.get("power_timeouts")),
             "firewall": bool(backup.get("firewall_state")),
             "visual_effects": any(backup.get(k) not in (None, "") for k in
                                    ("visual_fx_setting", "min_animate", "drag_full_windows")),
             "services": bool(backup.get("services_state")),
             "startup_apps": bool(backup.get("startup_apps_disabled")),
+            "usb_power": bool(backup.get("usb_power_states")),
         }
         vars_map = {}
         for cat in BACKUP_CATEGORIES:
@@ -3334,6 +3779,11 @@ class CleanerApp:
         # элементом кортежа — то, что просил пользователь: что конкретно
         # очистилось/включилось/отключилось и почему.
         step_details = {}
+        # Объём, реально освобождённый каждым пунктом (в байтах) — шаги
+        # сообщают его через report_freed_bytes(). Итог считается как
+        # сумма этих значений, а не как разница свободного места до/после
+        # (см. подробное объяснение в report_freed_bytes).
+        step_freed = {}
 
         def _make_logf(step_id):
             lines = []
@@ -3406,6 +3856,7 @@ class CleanerApp:
                     c_logf = _make_logf(c_id)
                     try:
                         result = c_func(c_logf, on_pid=_on_cleanmgr_pid, should_stop=_cleanmgr_should_stop)
+                        step_freed[c_title] = getattr(c_logf, "freed_bytes", 0)
                         if c_returns_text and result:
                             collected_texts.append(result)
                         state = "cancelled" if self.cleanmgr_stop_flag["stop"] else "done"
@@ -3447,6 +3898,7 @@ class CleanerApp:
                     result = func(step_logf, selected_names=self.services_selected)
                 else:
                     result = func(step_logf)
+                step_freed[title] = getattr(step_logf, "freed_bytes", 0)
                 if returns_text and result:
                     collected_texts.append(result)
                 self.msg_queue.put(("step_status", (step_id, "done")))
@@ -3482,25 +3934,33 @@ class CleanerApp:
 
         free_after = get_free_space_gb("C:\\")
         elapsed = time.time() - start_time
-        freed_gb = None
+
+        # Итог считаем суммой того, что шаги измерили сами. Разница
+        # свободного места остаётся в отчёте, но только справочно: она
+        # включает постороннюю запись на диск и потому бывает
+        # отрицательной даже при успешной очистке.
+        freed_gb = round(sum(step_freed.values()) / (1024 ** 3), 2)
+        delta_gb = None
         if free_before is not None and free_after is not None:
-            freed_gb = round(free_after - free_before, 2)
+            delta_gb = round(free_after - free_before, 2)
 
         report_path = self._write_report(
-            collected_system_info, free_before, free_after, elapsed, failures, cancelled, step_results
+            collected_system_info, free_before, free_after, elapsed, failures, cancelled,
+            step_results, step_freed, freed_gb, delta_gb,
         )
         rotate_old_reports()
 
         self.msg_queue.put(("done", (report_path, cancelled, freed_gb)))
 
-    def _write_report(self, speed_text, free_before, free_after, elapsed_sec, failures, cancelled, step_results=None):
+    def _write_report(self, speed_text, free_before, free_after, elapsed_sec, failures, cancelled,
+                      step_results=None, step_freed=None, freed_total_gb=None, delta_gb=None):
         date_str = datetime.date.today().isoformat()
         time_str = datetime.datetime.now().strftime("%H%M%S")
         report_path = os.path.join(get_app_data_dir(), f"sclean_{date_str}_{time_str}.txt")
 
-        freed = None
-        if free_before is not None and free_after is not None:
-            freed = round(free_after - free_before, 2)
+        step_freed = step_freed or {}
+        if delta_gb is None and free_before is not None and free_after is not None:
+            delta_gb = round(free_after - free_before, 2)
 
         status_labels = {
             "done": "выполнено",
@@ -3546,10 +4006,32 @@ class CleanerApp:
                         f.write(f"  - {title}: {reason}\n")
                     f.write("\n")
 
-                f.write(f"Свободно на диске C до очистки:  {free_before} ГБ\n")
+                # Итог освобождённого — сумма того, что пункты измерили
+                # сами (см. report_freed_bytes). Разница свободного места
+                # идёт ниже и отдельно, с оговоркой: во время работы
+                # система и другие программы тоже пишут на диск, поэтому
+                # она может быть меньше освобождённого и даже
+                # отрицательной, что раньше выглядело как ошибка.
+                measured = {t: b for t, b in step_freed.items() if b}
+                if freed_total_gb is not None:
+                    f.write(f"Освобождено места (подсчитано пунктами): {freed_total_gb} ГБ\n")
+                    for title, num_bytes in measured.items():
+                        f.write(f"  · {title}: {format_bytes_gb(num_bytes)} ГБ\n")
+                    if not measured:
+                        f.write("  · ни один из выполненных пунктов не удаляет файлы сам\n")
+                    f.write(
+                        "  Объём, освобождённый встроенной «Очисткой диска» Windows, сюда не входит —\n"
+                        "  cleanmgr не сообщает его программам.\n"
+                    )
+
+                f.write(f"\nСвободно на диске C до очистки:  {free_before} ГБ\n")
                 f.write(f"Свободно на диске C после очистки: {free_after} ГБ\n")
-                if freed is not None:
-                    f.write(f"Освобождено места: {freed} ГБ\n")
+                if delta_gb is not None:
+                    f.write(f"Изменение свободного места: {delta_gb} ГБ\n")
+                    f.write(
+                        "  (справочно: за время работы система и другие программы тоже пишут\n"
+                        "   на диск, поэтому величина может отличаться от строки выше)\n"
+                    )
                 f.write(f"Общее время выполнения: {elapsed_sec:.1f} сек\n")
 
                 if speed_text:
@@ -3631,11 +4113,12 @@ class CleanerApp:
                         self.progress.configure(value=100)
                     self._refresh_disk_usage_label()
 
-                    # Крупная сводка освобождённого места — только если
-                    # реально что-то освободилось (>0.05 ГБ, чтобы не
-                    # хвастаться округлением до нуля) и выполнение не было
-                    # отменено на полпути.
-                    if not cancelled and freed_gb is not None and freed_gb > 0.05:
+                    # Крупная сводка освобождённого места. Величина —
+                    # сумма измеренного самими пунктами, поэтому она
+                    # никогда не отрицательная (раньше сюда приходила
+                    # разница свободного места и могла быть вида -0.01).
+                    # Порог 0.01 ГБ отсекает округление до нуля.
+                    if not cancelled and freed_gb is not None and freed_gb >= 0.01:
                         self.freed_summary_label.configure(text=f"✓ Освобождено {freed_gb} ГБ")
                         self.freed_summary_label.pack(pady=(2, 4))
                     else:
