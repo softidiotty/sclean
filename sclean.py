@@ -17,7 +17,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.9.5"
+APP_VERSION = "1.9.6"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -2346,6 +2346,8 @@ class CleanerApp:
         collected_texts = []
         failures = []  # (title, причина) для шагов, завершившихся с ошибкой
         failures_lock = threading.Lock()
+        step_results = []  # (title, status) для всех выбранных пунктов, в отчёт
+        step_results_lock = threading.Lock()
         cancelled = False
 
         # "Очистка диска" (cleanmgr) показывает собственное окно, которое
@@ -2391,9 +2393,13 @@ class CleanerApp:
                         collected_texts.append(result)
                     state = "cancelled" if self.cleanmgr_stop_flag["stop"] else "done"
                     self.msg_queue.put(("step_status", (cleanmgr_id, state)))
+                    with step_results_lock:
+                        step_results.append((cleanmgr_title, state))
                 except Exception as e:
                     with failures_lock:
                         failures.append((cleanmgr_title, str(e)))
+                    with step_results_lock:
+                        step_results.append((cleanmgr_title, "error"))
                     self.msg_queue.put(("step_status", (cleanmgr_id, "error")))
 
             cleanmgr_thread = threading.Thread(target=_run_cleanmgr_async, daemon=True)
@@ -2405,6 +2411,7 @@ class CleanerApp:
                 cancelled = True
                 for rem_id, rem_title, *_r2 in other_steps[idx - 1:]:
                     self.msg_queue.put(("step_status", (rem_id, "cancelled")))
+                    step_results.append((rem_title, "cancelled"))
                 break
 
             self.msg_queue.put(("step_status", (step_id, "running")))
@@ -2417,9 +2424,11 @@ class CleanerApp:
                 if returns_text and result:
                     collected_texts.append(result)
                 self.msg_queue.put(("step_status", (step_id, "done")))
+                step_results.append((title, "done"))
             except Exception as e:
                 with failures_lock:
                     failures.append((title, str(e)))
+                step_results.append((title, "error"))
                 self.msg_queue.put(("step_status", (step_id, "error")))
             pct_after = int(round(idx / total_other * 100)) if total_other else 100
             self.msg_queue.put(("progress", pct_after))
@@ -2452,10 +2461,14 @@ class CleanerApp:
                 if si_returns_text and system_info_text:
                     system_info_path = self._write_system_info_report(system_info_text)
                 self.msg_queue.put(("step_status", (si_id, "done")))
+                step_results.append((si_title, "done"))
             except Exception as e:
                 with failures_lock:
                     failures.append((si_title, str(e)))
+                step_results.append((si_title, "error"))
                 self.msg_queue.put(("step_status", (si_id, "error")))
+        elif system_info_entry is not None and cancelled:
+            step_results.append((system_info_entry[1], "cancelled"))
 
         collected_system_info = "\n".join(collected_texts)
 
@@ -2463,7 +2476,7 @@ class CleanerApp:
         elapsed = time.time() - start_time
 
         report_path = self._write_report(
-            collected_system_info, free_before, free_after, elapsed, failures, cancelled
+            collected_system_info, free_before, free_after, elapsed, failures, cancelled, step_results
         )
         rotate_old_reports()
 
@@ -2486,7 +2499,7 @@ class CleanerApp:
             return None
         return path
 
-    def _write_report(self, speed_text, free_before, free_after, elapsed_sec, failures, cancelled):
+    def _write_report(self, speed_text, free_before, free_after, elapsed_sec, failures, cancelled, step_results=None):
         date_str = datetime.date.today().isoformat()
         time_str = datetime.datetime.now().strftime("%H%M%S")
         report_path = os.path.join(get_app_data_dir(), f"sclean_{date_str}_{time_str}.txt")
@@ -2494,6 +2507,12 @@ class CleanerApp:
         freed = None
         if free_before is not None and free_after is not None:
             freed = round(free_after - free_before, 2)
+
+        status_labels = {
+            "done": "выполнено",
+            "error": "ошибка",
+            "cancelled": "отменено",
+        }
 
         try:
             with open(report_path, "w", encoding="utf-8") as f:
@@ -2503,6 +2522,16 @@ class CleanerApp:
 
                 if cancelled:
                     f.write("Внимание: выполнение было прервано пользователем (отмена).\n\n")
+
+                # Список всех выбранных пунктов и что с ними произошло —
+                # без этого раздела по отчёту нельзя понять, что вообще
+                # было отмечено к выполнению.
+                if step_results:
+                    f.write("Выбранные пункты:\n")
+                    for title, status in step_results:
+                        label = status_labels.get(status, status)
+                        f.write(f"  [{label}] {title}\n")
+                    f.write("\n")
 
                 # Причины невыполнения пунктов показываются, только если
                 # что-то реально не сработало — если всё прошло без ошибок,
