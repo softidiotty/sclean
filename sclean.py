@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.15.1"
+APP_VERSION = "1.15.2"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -3093,6 +3093,15 @@ class CleanerApp:
         # Кнопка появляется только когда диагностика закончится — до тех
         # пор разворачивать нечего.
 
+        # Копирование всей диагностики одной кнопкой — тот же приём, что
+        # и у сведений о системе выше: выделять мышью многострочный блок
+        # неудобно, а переслать результат нужно как раз целиком.
+        # Показывается вместе с кнопкой "Подробнее", по готовности.
+        self.copy_diag_btn = ttk.Button(
+            diag_row, text="Копировать", width=12, command=self._copy_diagnostics,
+        )
+        Tooltip(self.copy_diag_btn, "Скопировать результат диагностики железа в буфер обмена")
+
         self.diag_details_frame = tk.Frame(block1, bg=DARK_BG)
         # height задаётся динамически по фактическому числу строк (см.
         # _apply_hardware_diagnostics): после того как из блока убрали
@@ -3499,7 +3508,25 @@ class CleanerApp:
         line_count = text.count("\n") + 1
         self.diag_details_text.configure(height=min(max(line_count, 4), 20))
         self.diag_toggle_btn.pack(side="left", padx=(8, 0))
+        self.copy_diag_btn.pack(side="right", padx=(6, 0))
         self._draw_diag_toggle()
+
+    def _copy_diagnostics(self):
+        """
+        Кладёт весь результат диагностики железа в буфер обмена.
+        Работает независимо от того, развёрнута панель или нет: текст
+        хранится в self._diag_text, а не берётся из виджета.
+        """
+        text = (self._diag_text or "").strip()
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            return
+        self.copy_diag_btn.configure(text="Скопировано")
+        self.root.after(1200, lambda: self.copy_diag_btn.configure(text="Копировать"))
 
     def _draw_diag_toggle(self):
         if self._diag_expanded:
