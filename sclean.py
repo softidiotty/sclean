@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.1"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -477,10 +477,26 @@ def save_backup(data):
 
 
 def backup_power_plan(logf):
+    """
+    Сохраняет GUID активной схемы электропитания.
+
+    Раньше GUID вырезался через -replace по шаблону '.*GUID: ...' —
+    но это работает только на английской Windows. На русской powercfg
+    печатает "GUID схемы питания: 8c5e7fda-... (Высокая
+    производительность)", шаблон не совпадал, и в бэкап уходила ВСЯ
+    строка целиком. При восстановлении powercfg /setactive получал эту
+    строку вместо GUID и молча падал — то есть откат электропитания
+    фактически не работал ни разу на русской системе.
+
+    Теперь GUID ищется регулярным выражением по своей форме
+    (8-4-4-4-12 hex), без привязки к языку подписи вокруг него.
+    """
     out = run_ps(
-        "(powercfg /getactivescheme) -replace '.*GUID: ([0-9a-fA-F-]+).*', '$1'"
+        "$t = (powercfg /getactivescheme | Out-String); "
+        "[regex]::Match($t, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        "[0-9a-fA-F]{4}-[0-9a-fA-F]{12}').Value"
     )
-    guid = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    guid = (out or "").strip().splitlines()[-1].strip() if (out or "").strip() else ""
     if guid:
         save_backup({"power_plan_guid": guid})
         logf(f"  Бэкап: текущая схема электропитания сохранена ({guid}).")
@@ -489,13 +505,61 @@ def backup_power_plan(logf):
 
 
 def backup_firewall(logf):
+    """
+    Сохраняет состояние (вкл/выкл) трёх профилей брандмауэра.
+
+    Раньше состояние определялось разбором текста `netsh advfirewall
+    show <profile> state` на подстроки "ON"/"OFF" — но netsh печатает
+    локализованный вывод, и на русской Windows там "ВКЛ"/"ОТКЛ". Ни одна
+    из подстрок не находилась, и в бэкап для всех профилей уходило
+    "UNKNOWN". Восстановление же применяет состояние только если оно
+    равно "ON" или "OFF" — то есть откат брандмауэра тихо не делал
+    ничего, хотя в отчёте выглядел успешным.
+
+    Get-NetFirewallProfile возвращает булево поле Enabled, не зависящее
+    от языка системы. netsh оставлен как резерв на случай, если модуль
+    NetSecurity недоступен (урезанные сборки Windows).
+    """
     states = {}
+    out = run_ps(
+        "try { Get-NetFirewallProfile -ErrorAction Stop | "
+        "ForEach-Object { Write-Output ($_.Name + '=' + $_.Enabled) } } catch { Write-Output 'FAIL' }"
+    )
+    parsed = {}
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if "=" in line:
+            name, _, value = line.partition("=")
+            name = name.strip().capitalize()
+            value = value.strip().lower()
+            if value in ("true", "1"):
+                parsed[name] = "ON"
+            elif value in ("false", "0"):
+                parsed[name] = "OFF"
+
     for profile in ("Domain", "Private", "Public"):
-        code, out, err = run_cmd(f"netsh advfirewall show {profile.lower()}profile state", timeout=15)
-        enabled = "ON" if out and "ON" in out.upper() else "OFF" if out and "OFF" in out.upper() else "UNKNOWN"
-        states[profile] = enabled
+        if profile in parsed:
+            states[profile] = parsed[profile]
+            continue
+        # Резервный путь: netsh. Проверяем и английские, и русские
+        # варианты подписи состояния.
+        code, netsh_out, err = run_cmd(
+            f"netsh advfirewall show {profile.lower()}profile state", timeout=15
+        )
+        text = (netsh_out or "").upper()
+        if "ВКЛ" in text or " ON" in text:
+            states[profile] = "ON"
+        elif "ОТКЛ" in text or "ВЫКЛ" in text or " OFF" in text:
+            states[profile] = "OFF"
+        else:
+            states[profile] = "UNKNOWN"
+
     save_backup({"firewall_state": states})
-    logf(f"  Бэкап: состояние брандмауэра сохранено ({states}).")
+    unknown = [p for p, s in states.items() if s == "UNKNOWN"]
+    if unknown:
+        logf(f"  Бэкап: состояние брандмауэра сохранено ({states}); не определено: {', '.join(unknown)}.")
+    else:
+        logf(f"  Бэкап: состояние брандмауэра сохранено ({states}).")
 
 
 def backup_visual_effects(logf):
@@ -771,60 +835,153 @@ def step_recycle_bin(logf):
     logf(f"  Результат: {(out or 'нет ответа').strip()}")
 
 
-CLEANMGR_SAGESET_ID = "65432"  # произвольный номер профиля, используется только этой программой
+# Два независимых профиля очистки диска (номера произвольные, использует
+# только эта программа). Раньше был один профиль, в который помечались
+# ВСЕ категории VolumeCaches разом — включая тяжёлые, связанные с
+# обслуживанием хранилища компонентов Windows. Эти категории cleanmgr не
+# обрабатывает сам, а перекладывает на TiWorker.exe ("Установщик модулей
+# Windows"), который на машине с накопленными обновлениями работает
+# 20-60 минут. Снаружи это выглядело как зависание пункта "Очистка
+# диска": окно давно закрылось, а процессы cleanmgr.exe всё ещё висят.
+# Теперь лёгкие категории идут в быстрый основной пункт, а тяжёлые — в
+# отдельный пункт "Глубокая очистка обновлений Windows", который
+# отмечается вручную, когда есть время его дождаться.
+CLEANMGR_SAGESET_ID = "65432"        # лёгкие категории (обычная очистка диска)
+CLEANMGR_DEEP_SAGESET_ID = "65433"   # тяжёлые категории (глубокая очистка обновлений)
+
+# Категории VolumeCaches, которые запускают обслуживание хранилища
+# компонентов через TiWorker.exe и потому непредсказуемо долгие.
+# Имена ключей реестра стабильны между версиями Windows 10/11.
+CLEANMGR_HEAVY_CATEGORIES = (
+    "Update Cleanup",                     # Очистка обновлений Windows
+    "Previous Installations",             # Предыдущие установки Windows
+    "Windows ESD installation files",     # Файлы установки ESD
+    "Delivery Optimization Files",        # Файлы оптимизации доставки
+    "Windows Upgrade Log Files",          # Журналы обновления Windows
+    "Setup Log Files",                    # Журналы установки
+    # Ниже — категории, тяжёлые не удалением, а ЭТАПОМ ОЦЕНКИ: cleanmgr
+    # обходит по ним огромные деревья файлов, показывая окно "Программа
+    # очистки оценивает объём места...". Именно на "Диагностических
+    # данных" очистка визуально замирала на минуты, хотя удалять там
+    # почти нечего — держим их в глубоком профиле.
+    "Diagnostic Data Viewer Database Files",  # Диагностические данные
+    "Feedback Hub Archive log files",         # Архив Центра отзывов
+    "Windows Defender",                       # Файлы Защитника Windows
+    "System error memory dump files",         # Дампы памяти
+    "System error minidump files",            # Малые дампы памяти
+)
+
+# Жёсткий предел на весь пункт очистки диска. Достигается редко —
+# обычно раньше срабатывает детектор простоя (см. _cleanmgr_cpu_seconds),
+# но без этого предела цикл опроса мог ждать вечно.
+CLEANMGR_MAX_SECONDS = 15 * 60
+
+# Если суммарное процессорное время cleanmgr.exe + TiWorker.exe не растёт
+# столько секунд подряд — считаем, что процесс завис (а не работает
+# медленно), и прерываем, не дожидаясь общего таймаута.
+CLEANMGR_STALL_SECONDS = 4 * 60
 
 
-def step_cleanmgr(logf, on_pid=None, should_stop=None):
+def _cleanmgr_cpu_seconds():
     """
-    cleanmgr /sagerun запускается в обычном, полностью видимом режиме —
-    пользователь видит прогресс по каждой категории очистки в отдельных
-    окошках, которые появляются и исчезают сами по себе (это нормальное
-    штатное поведение самого cleanmgr, не баг).
+    Суммарное процессорное время (в секундах) всех процессов, участвующих
+    в очистке диска: самого cleanmgr.exe и TiWorker.exe, которому он
+    делегирует тяжёлые категории. Растущее значение = работа реально
+    идёт, пусть и медленно; замершее = процесс завис и ждать бесполезно.
 
-    Важно: нельзя дождаться завершения через proc.wait() на PID
-    изначально запущенного процесса — на практике cleanmgr иногда
-    порождает дополнительный процесс с тем же именем (или пересоздаёт
-    себя) в процессе работы, из-за чего исходный PID завершается
-    (proc.wait() возвращается), пока настоящая очистка продолжается в
-    другом процессе. Поэтому вместо ожидания одного PID мы каждые пару
-    секунд опрашиваем систему по имени процесса "cleanmgr.exe" через
-    tasklist и считаем очистку завершённой только тогда, когда таких
-    процессов не осталось совсем — это учитывает и дочерние/повторные
-    процессы, а не только тот, что мы запустили напрямую.
-
-    on_pid, если передан, вызывается с PID запущенного процесса cleanmgr
-    сразу после старта — даёт GUI возможность быстро найти хоть один
-    PID для информации, но принудительное завершение (кнопка в GUI)
-    всё равно бьёт по имени процесса, а не по этому PID, по той же
-    причине. should_stop, если передан, — функция без аргументов,
-    возвращающая True, если пользователь запросил принудительную
-    остановку через GUI — тогда опрос сразу прекращается.
+    Это надёжнее, чем следить за свободным местом на диске (место может
+    не меняться подолгу в середине легитимной работы) или за наличием
+    окна (окно cleanmgr закрывается задолго до конца работы TiWorker).
+    Возвращает None, если опросить не удалось — вызывающий код тогда
+    просто не обновляет детектор простоя.
     """
-    logf("Настройка профиля очистки диска (без диалогов выбора категорий)...")
+    ps = (
+        "$total = 0; "
+        "foreach ($n in @('cleanmgr','TiWorker')) { "
+        "  Get-Process -Name $n -ErrorAction SilentlyContinue | "
+        "  ForEach-Object { try { $total += $_.CPU } catch {} } "
+        "}; "
+        "Write-Output $total"
+    )
+    out = run_ps(ps, timeout=15)
+    try:
+        return float((out or "").strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
 
-    # Отмечаем "выбрано" (StateFlags<ID>=2) для всех известных категорий
-    # очистки диска — тот же набор, что и /verylowdisk выбирает по умолчанию.
+
+def _run_cleanmgr_profile(logf, sageset_id, heavy, on_pid=None, should_stop=None):
+    """
+    Общая реализация запуска cleanmgr для обоих пунктов очистки диска.
+
+    heavy=False — в профиль попадают все категории VolumeCaches, КРОМЕ
+    перечисленных в CLEANMGR_HEAVY_CATEGORIES; heavy=True — наоборот,
+    только они. Разделение сделано потому, что тяжёлые категории
+    делегируют работу TiWorker.exe и идут непредсказуемо долго; смешивать
+    их с быстрыми в одном пункте означало, что обычная очистка диска
+    случайным образом то занимает минуту, то висит час.
+
+    Ожидание завершения не может опираться на proc.wait() исходного PID:
+    cleanmgr порождает дополнительные процессы с тем же именем, из-за
+    чего исходный PID завершается, пока реальная очистка продолжается.
+    Поэтому опрашиваем систему по имени процесса. Чтобы это ожидание не
+    стало бесконечным, есть два предохранителя:
+      * жёсткий общий таймаут CLEANMGR_MAX_SECONDS;
+      * детектор простоя: если суммарное процессорное время cleanmgr.exe
+        и TiWorker.exe не растёт CLEANMGR_STALL_SECONDS подряд — работа
+        не идёт, ждать дальше бессмысленно.
+    В обоих случаях процессы cleanmgr.exe принудительно завершаются, а
+    пункт помечается выполненным с пояснением в отчёте — вместо
+    бесконечного "выполняется" в интерфейсе.
+
+    on_pid вызывается с PID запущенного процесса (для кнопки "Завершить
+    очистку диска" в GUI). should_stop — функция без аргументов,
+    возвращающая True, если пользователь запросил остановку.
+    """
+    kind = "тяжёлые (обслуживание хранилища компонентов)" if heavy else "быстрые"
+    logf(f"Настройка профиля очистки диска — категории: {kind}...")
+
+    # Сначала сбрасываем StateFlags этого профиля у ВСЕХ категорий, потом
+    # выставляем 2 только нужным. Без сброса категория, попавшая в профиль
+    # в прошлой версии программы, осталась бы отмеченной навсегда — именно
+    # так тяжёлые категории могли бы продолжать тормозить быстрый пункт
+    # после обновления.
+    heavy_list = ", ".join(f"'{c}'" for c in CLEANMGR_HEAVY_CATEGORIES)
+    want_value = "2" if heavy else "0"
+    other_value = "0" if heavy else "2"
     ps = (
         "$base = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VolumeCaches'; "
+        f"$heavy = @({heavy_list}); "
+        "$selected = 0; "
         "Get-ChildItem $base | ForEach-Object { "
-        f"  try {{ Set-ItemProperty -Path $_.PsPath -Name 'StateFlags{CLEANMGR_SAGESET_ID}' -Value 2 -Type DWord -ErrorAction Stop }} catch {{}} "
+        "  $isHeavy = $heavy -contains $_.PSChildName; "
+        f"  $val = if ($isHeavy) {{ {want_value} }} else {{ {other_value} }}; "
+        f"  try {{ Set-ItemProperty -Path $_.PsPath -Name 'StateFlags{sageset_id}' -Value $val -Type DWord -ErrorAction Stop; "
+        "         if ($val -eq 2) { $selected++ } } catch {} "
         "}; "
-        "Write-Output OK"
+        "Write-Output $selected"
     )
-    out = run_ps(ps, timeout=30)
-    if out.strip() == "OK":
-        logf("  Профиль очистки настроен на все доступные категории.")
+    out = run_ps(ps, timeout=60)
+    selected = (out or "").strip()
+    if selected.isdigit() and int(selected) > 0:
+        logf(f"  В профиль включено категорий: {selected}.")
+    elif selected.isdigit():
+        logf("  Ни одна категория этого типа не доступна в системе — пропущено.")
+        return
     else:
-        logf("  Не удалось настроить профиль через реестр, пробуем стандартный режим...")
+        logf("  Не удалось настроить профиль через реестр — пункт пропущен.")
+        return
 
-    logf(f"Запуск cleanmgr /sagerun:{CLEANMGR_SAGESET_ID} — окна прогресса появляются")
-    logf("  и закрываются сами по каждой категории, это нормально...")
+    logf(f"Запуск cleanmgr /sagerun:{sageset_id}...")
+    if heavy:
+        logf("  Тяжёлые категории обрабатывает TiWorker.exe («Установщик модулей")
+        logf("  Windows») — окно cleanmgr может закрыться задолго до конца работы.")
 
     system_root = os.environ.get("SystemRoot", r"C:\Windows")
     cleanmgr_path = os.path.join(system_root, "System32", "cleanmgr.exe")
     try:
         proc = subprocess.Popen(
-            [cleanmgr_path, f"/sagerun:{CLEANMGR_SAGESET_ID}"],
+            [cleanmgr_path, f"/sagerun:{sageset_id}"],
             cwd=SAFE_CWD,
         )
     except Exception as e:
@@ -844,9 +1001,24 @@ def step_cleanmgr(logf, on_pid=None, should_stop=None):
 
     poll_interval = 2
     consecutive_errors = 0
+    started_at = time.time()
+    last_cpu = _cleanmgr_cpu_seconds()
+    last_progress_at = time.time()
+
     while True:
         if should_stop and should_stop():
-            logf("  Очистка диска остановлена принудительно.")
+            _kill_processes_by_name("cleanmgr.exe")
+            logf("  Очистка диска остановлена принудительно пользователем.")
+            return
+
+        elapsed = time.time() - started_at
+        if elapsed >= CLEANMGR_MAX_SECONDS:
+            _kill_processes_by_name("cleanmgr.exe")
+            logf(
+                f"  Достигнут общий предел времени ({format_eta(int(CLEANMGR_MAX_SECONDS))}) — "
+                "очистка прервана принудительно."
+            )
+            logf("  Часть категорий могла не успеть обработаться; повторный запуск продолжит с места остановки.")
             return
 
         count = _count_processes_by_name("cleanmgr.exe")
@@ -860,14 +1032,69 @@ def step_cleanmgr(logf, on_pid=None, should_stop=None):
             consecutive_errors += 1
             if consecutive_errors >= 5:
                 logf("  Не удалось опросить список процессов, ожидаем исходный процесс напрямую...")
-                proc.wait()
+                try:
+                    proc.wait(timeout=max(60, CLEANMGR_MAX_SECONDS - elapsed))
+                except Exception:
+                    _kill_processes_by_name("cleanmgr.exe")
+                    logf("  Исходный процесс не завершился в отведённое время — прервано.")
                 break
         else:
             consecutive_errors = 0
 
+        # Детектор простоя: растёт ли процессорное время участников очистки.
+        cpu_now = _cleanmgr_cpu_seconds()
+        if cpu_now is not None:
+            if last_cpu is None or cpu_now > last_cpu + 0.5:
+                last_cpu = cpu_now
+                last_progress_at = time.time()
+            elif time.time() - last_progress_at >= CLEANMGR_STALL_SECONDS:
+                _kill_processes_by_name("cleanmgr.exe")
+                logf(
+                    f"  Очистка не подаёт признаков работы {format_eta(int(CLEANMGR_STALL_SECONDS))} "
+                    "(процессорное время не растёт) — считаем зависанием, прервано."
+                )
+                return
+
         time.sleep(poll_interval)
 
-    logf("  cleanmgr завершён — все процессы cleanmgr.exe закрыты.")
+    logf(f"  cleanmgr завершён за {format_eta(int(time.time() - started_at))} — все процессы закрыты.")
+
+
+def step_cleanmgr(logf, on_pid=None, should_stop=None):
+    """
+    Быстрая очистка диска: все категории cleanmgr, кроме тяжёлых
+    (обслуживание хранилища компонентов Windows) — они вынесены в
+    отдельный пункт step_cleanmgr_deep.
+    """
+    return _run_cleanmgr_profile(
+        logf, CLEANMGR_SAGESET_ID, heavy=False, on_pid=on_pid, should_stop=should_stop,
+    )
+
+
+def step_cleanmgr_deep(logf, on_pid=None, should_stop=None):
+    """
+    Глубокая очистка обновлений Windows: тяжёлые категории cleanmgr плюс
+    DISM /StartComponentCleanup, который сжимает хранилище компонентов
+    (WinSxS) — вместе они освобождают заметно больше места, чем обычная
+    очистка диска, но требуют времени и обслуживают одно и то же
+    хранилище, поэтому логично идут одним пунктом.
+    """
+    _run_cleanmgr_profile(
+        logf, CLEANMGR_DEEP_SAGESET_ID, heavy=True, on_pid=on_pid, should_stop=should_stop,
+    )
+
+    if should_stop and should_stop():
+        logf("  DISM пропущен — выполнение остановлено пользователем.")
+        return
+
+    logf("Сжатие хранилища компонентов: DISM /StartComponentCleanup...")
+    code, out, err = run_cmd(
+        "DISM /Online /Cleanup-Image /StartComponentCleanup", timeout=CLEANMGR_MAX_SECONDS,
+    )
+    if code == 0:
+        logf("  Хранилище компонентов очищено (устаревшие версии обновлений удалены).")
+    else:
+        logf(f"  DISM завершился с кодом {code} — часть обновлений могла остаться: {(err or out or '').strip()[:200]}")
 
 
 def step_sfc_dism(logf):
@@ -1142,43 +1369,85 @@ def step_restore_points(logf):
 def step_usb_power_management(logf):
     """
     Отключает галочку "Разрешить отключение этого устройства для
-    экономии энергии" в диспетчере устройств для всех USB-концентраторов
-    и корневых USB-хабов — та же настройка, что видна в свойствах
-    устройства -> вкладка "Управление электропитанием". Отличается от
-    USB selective suspend в схеме электропитания (см. step_power_plan):
-    там политика применяется на уровне всей системы, а здесь — на
-    уровне конкретных устройств в реестре (EnhancedPowerManagementEnabled
-    под каждым USB-хабом), поэтому нужны обе настройки, чтобы порты
-    гарантированно не отключались (актуально для сканеров штрихкодов,
-    чековых принтеров и прочей периферии на моноблоках/планшетах).
+    экономии энергии" (свойства устройства -> вкладка "Управление
+    электропитанием") для всех USB-концентраторов.
+
+    Важно про выбор ключей реестра. В первой версии этого пункта
+    выставлялся только EnhancedPowerManagementEnabled — и пункт
+    рапортовал об успехе, хотя галочка в диспетчере устройств
+    оставалась включённой. Причина: EnhancedPowerManagementEnabled
+    относится к управлению питанием линка USB 3.0, а состояние самой
+    галочки хранится в SelectiveSuspendEnabled. Теперь выставляются оба
+    значения, и результат проверяется обратным чтением, чтобы отчёт не
+    врал об успехе.
+
+    Дополнительно выставляется машинный переключатель
+    HKLM\\SYSTEM\\CurrentControlSet\\Services\\USB\\DisableSelectiveSuspend=1 —
+    он запрещает выборочную приостановку USB глобально, поверх настроек
+    отдельных устройств, и потому надёжнее всего для POS-периферии
+    (сканеры штрихкодов, чековые принтеры), которая иначе отваливается.
+
+    Все три настройки применяются к драйверу при следующей загрузке —
+    до перезагрузки галочка в диспетчере устройств может оставаться
+    отмеченной, о чём пункт честно пишет в отчёт.
     """
-    logf("Отключение энергосбережения USB-портов (диспетчер устройств)...")
-    ps = (
-        "$count = 0; $touched = 0; "
-        "$hubs = Get-PnpDevice -Class 'USB' -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.FriendlyName -match 'Hub|Host Controller|Root' -or $_.Class -eq 'USB' }; "
-        "foreach ($hub in $hubs) { "
-        "  $count++; "
-        "  $key = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\' + $hub.InstanceId + '\\Device Parameters'; "
-        "  if (Test-Path $key) { "
-        "    try { "
-        "      Set-ItemProperty -Path $key -Name 'EnhancedPowerManagementEnabled' -Value 0 -Type DWord -ErrorAction Stop; "
-        "      $touched++; "
-        "    } catch {} "
-        "  } "
-        "}; "
-        "Write-Output ($count.ToString() + '|' + $touched.ToString())"
+    logf("Отключение энергосбережения USB-портов...")
+
+    # 1. Глобальный запрет выборочной приостановки USB.
+    global_ps = (
+        "$k = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\USB'; "
+        "try { "
+        "  if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null }; "
+        "  Set-ItemProperty -Path $k -Name 'DisableSelectiveSuspend' -Value 1 -Type DWord -ErrorAction Stop; "
+        "  $v = (Get-ItemProperty -Path $k -Name 'DisableSelectiveSuspend').DisableSelectiveSuspend; "
+        "  Write-Output $v "
+        "} catch { Write-Output 'ERR' }"
     )
-    out = run_ps(ps, timeout=60)
-    parts = (out or "").strip().split("|")
-    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-        found, touched = int(parts[0]), int(parts[1])
-        if found == 0:
-            logf("  USB-устройства не найдены — пропущено.")
-        else:
-            logf(f"  Найдено USB-устройств: {found}, энергосбережение отключено для {touched}.")
+    gout = (run_ps(global_ps, timeout=30) or "").strip()
+    if gout == "1":
+        logf("  Глобальный запрет выборочной приостановки USB включён (Services\\USB\\DisableSelectiveSuspend=1).")
     else:
-        logf("  Не удалось применить настройку через реестр — пропущено.")
+        logf(f"  Не удалось включить глобальный запрет выборочной приостановки USB (ответ: {gout or 'нет'}).")
+
+    # 2. Пер-устройственные значения + обратная проверка. Проверяем
+    # именно SelectiveSuspendEnabled — это то, что отражает галочка.
+    ps = (
+        "$total = 0; $set = 0; $verified = 0; "
+        "$devs = Get-PnpDevice -Class 'USB' -ErrorAction SilentlyContinue; "
+        "foreach ($d in $devs) { "
+        "  if (-not $d.InstanceId) { continue }; "
+        "  $total++; "
+        "  $key = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\' + $d.InstanceId + '\\Device Parameters'; "
+        "  if (-not (Test-Path $key)) { continue }; "
+        "  try { "
+        "    Set-ItemProperty -Path $key -Name 'SelectiveSuspendEnabled' -Value 0 -Type DWord -ErrorAction Stop; "
+        "    $set++; "
+        "  } catch {} "
+        "  try { "
+        "    Set-ItemProperty -Path $key -Name 'EnhancedPowerManagementEnabled' -Value 0 -Type DWord -ErrorAction SilentlyContinue; "
+        "  } catch {} "
+        "  try { "
+        "    $v = (Get-ItemProperty -Path $key -Name 'SelectiveSuspendEnabled' -ErrorAction Stop).SelectiveSuspendEnabled; "
+        "    if ($v -eq 0) { $verified++ } "
+        "  } catch {} "
+        "}; "
+        "Write-Output ($total.ToString() + '|' + $set.ToString() + '|' + $verified.ToString())"
+    )
+    out = run_ps(ps, timeout=120)
+    parts = (out or "").strip().split("|")
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        total, was_set, verified = (int(p) for p in parts)
+        if total == 0:
+            logf("  USB-устройства не найдены — пропущено.")
+            return
+        logf(f"  Найдено USB-устройств: {total}, настройка записана для {was_set}, подтверждена чтением: {verified}.")
+        if verified < was_set:
+            logf("  Часть значений не подтвердилась при обратном чтении — возможно, драйвер перезаписал их.")
+    else:
+        logf(f"  Не удалось применить настройку по устройствам (ответ: {(out or '').strip()[:120] or 'нет'}).")
+
+    logf("  Настройки вступят в силу после перезагрузки; до неё галочка в диспетчере")
+    logf("  устройств может отображаться отмеченной, хотя запрет уже записан.")
 
 
 def _find_speedtest_cli():
@@ -1347,9 +1616,10 @@ STEPS = [
      "Полностью очищает корзину без подтверждения.",
      True, False, 5),
     ("cleanmgr",       "Очистка диска (cleanmgr)", step_cleanmgr, False,
-     "Запускает встроенную «Очистку диска» Windows по всем доступным категориям.\n"
-     "Категории выбираются автоматически, но окно программы отображается как обычно —\n"
-     "закройте его сами по завершении очистки. Может занять несколько минут.",
+     "Запускает встроенную «Очистку диска» Windows по быстрым категориям (временные\n"
+     "файлы, кэши, корзина, эскизы и похожие). Тяжёлые категории, связанные с\n"
+     "обновлениями Windows, вынесены в отдельный пункт «Глубокая очистка обновлений»,\n"
+     "чтобы этот пункт всегда выполнялся предсказуемо быстро и не подвисал.",
      True, False, 90),
     ("sfc_dism",       "Проверка системы: sfc /scannow + DISM RestoreHealth", step_sfc_dism, False,
      "Проверяет и восстанавливает целостность системных файлов Windows.\n"
@@ -1383,6 +1653,13 @@ STEPS = [
      "освобождает место на тесных SSD моноблоков. Не входит в бэкап sclean —\n"
      "это отдельный, независимый механизм самой Windows.",
      True, False, 15),
+    ("cleanmgr_deep", "Глубокая очистка обновлений Windows", step_cleanmgr_deep, False,
+     "Удаляет старые обновления, предыдущие установки Windows, файлы ESD и оптимизации\n"
+     "доставки, затем сжимает хранилище компонентов (WinSxS) через DISM.\n"
+     "Освобождает больше всего места (часто 3-10 ГБ), но работает долго — обработку\n"
+     "ведёт «Установщик модулей Windows» (TiWorker.exe). Отмечайте, когда есть время:\n"
+     "выполнение прерывается автоматически через 15 минут или при зависании.",
+     False, False, 900),
     ("usb_power", "Отключить энергосбережение USB-портов", step_usb_power_management, False,
      "Снимает галочку «Разрешить отключение этого устройства для экономии энергии»\n"
      "в диспетчере устройств для всех USB-концентраторов — порты не будут отключаться\n"
@@ -1410,6 +1687,7 @@ STEP_ICONS = {
     "firewall": "🧱",
     "disable_services": "⚙",
     "restore_points": "📍",
+    "cleanmgr_deep": "📦",
     "usb_power": "🔌",
     "internet_speed": "🌐",
 }
@@ -3026,19 +3304,25 @@ class CleanerApp:
         # цикл ниже обрабатывает все прочие пункты последовательно и не
         # ждёт его. Перед финальным отчётом мы дожидаемся завершения этого
         # потока, чтобы "Освобождено места" учитывало и его результат.
-        cleanmgr_entry = None
+        # Оба пункта на базе cleanmgr ("Очистка диска" и "Глубокая очистка
+        # обновлений Windows") делят одно пространство имён процессов:
+        # определение завершения и принудительная остановка работают по
+        # имени cleanmgr.exe. Запускать их одновременно нельзя — они
+        # видели бы процессы друг друга и завершали бы их. Поэтому оба
+        # уходят в ОДИН фоновый поток и выполняются в нём последовательно,
+        # параллельно остальным пунктам.
+        cleanmgr_entries = []
         other_steps = []
         for step in steps_to_run:
-            if step[0] == "cleanmgr":
-                cleanmgr_entry = step
+            if step[0] in ("cleanmgr", "cleanmgr_deep"):
+                cleanmgr_entries.append(step)
             else:
                 other_steps.append(step)
 
         cleanmgr_thread = None
-        if cleanmgr_entry is not None:
-            cleanmgr_id, cleanmgr_title, cleanmgr_func, cleanmgr_returns_text = cleanmgr_entry[:4]
-            self.msg_queue.put(("step_status", (cleanmgr_id, "running")))
-            self.msg_queue.put(("status", f"Выполняется в фоне: {cleanmgr_title} (закройте окно по завершении)"))
+        if cleanmgr_entries:
+            first_title = cleanmgr_entries[0][1]
+            self.msg_queue.put(("status", f"Выполняется в фоне: {first_title}"))
 
             self.cleanmgr_stop_flag["stop"] = False
 
@@ -3052,21 +3336,30 @@ class CleanerApp:
                 return self.cleanmgr_stop_flag["stop"]
 
             def _run_cleanmgr_async():
-                cleanmgr_logf = _make_logf(cleanmgr_id)
-                try:
-                    result = cleanmgr_func(cleanmgr_logf, on_pid=_on_cleanmgr_pid, should_stop=_cleanmgr_should_stop)
-                    if cleanmgr_returns_text and result:
-                        collected_texts.append(result)
-                    state = "cancelled" if self.cleanmgr_stop_flag["stop"] else "done"
-                    self.msg_queue.put(("step_status", (cleanmgr_id, state)))
-                    with step_results_lock:
-                        step_results.append((cleanmgr_title, state, step_details.get(cleanmgr_id, [])))
-                except Exception as e:
-                    with failures_lock:
-                        failures.append((cleanmgr_title, str(e)))
-                    with step_results_lock:
-                        step_results.append((cleanmgr_title, "error", step_details.get(cleanmgr_id, [])))
-                    self.msg_queue.put(("step_status", (cleanmgr_id, "error")))
+                for entry in cleanmgr_entries:
+                    c_id, c_title, c_func, c_returns_text = entry[:4]
+                    if self.cleanmgr_stop_flag["stop"] or self.cancel_requested:
+                        self.msg_queue.put(("step_status", (c_id, "cancelled")))
+                        with step_results_lock:
+                            step_results.append((c_title, "cancelled", step_details.get(c_id, [])))
+                        continue
+
+                    self.msg_queue.put(("step_status", (c_id, "running")))
+                    c_logf = _make_logf(c_id)
+                    try:
+                        result = c_func(c_logf, on_pid=_on_cleanmgr_pid, should_stop=_cleanmgr_should_stop)
+                        if c_returns_text and result:
+                            collected_texts.append(result)
+                        state = "cancelled" if self.cleanmgr_stop_flag["stop"] else "done"
+                        self.msg_queue.put(("step_status", (c_id, state)))
+                        with step_results_lock:
+                            step_results.append((c_title, state, step_details.get(c_id, [])))
+                    except Exception as e:
+                        with failures_lock:
+                            failures.append((c_title, str(e)))
+                        with step_results_lock:
+                            step_results.append((c_title, "error", step_details.get(c_id, [])))
+                        self.msg_queue.put(("step_status", (c_id, "error")))
 
             cleanmgr_thread = threading.Thread(target=_run_cleanmgr_async, daemon=True)
             cleanmgr_thread.start()
@@ -3114,12 +3407,13 @@ class CleanerApp:
             # так по интерфейсу видно, что программа не зависла, а реально
             # ждёт, пока пользователь закроет окно очистки диска.
             wait_start = time.time()
+            limit_txt = format_eta(int(CLEANMGR_MAX_SECONDS))
             while cleanmgr_thread.is_alive():
                 waited = int(time.time() - wait_start)
                 self.msg_queue.put((
                     "status",
-                    f"Очистка диска работает в фоне ({format_eta(waited)}) — "
-                    f"закройте её окно, когда закончит, или нажмите «Завершить очистку диска»",
+                    f"Очистка диска работает в фоне ({format_eta(waited)}, предел {limit_txt} на пункт) — "
+                    f"прервётся сама при зависании, или нажмите «Завершить очистку диска»",
                 ))
                 cleanmgr_thread.join(timeout=2)
 
