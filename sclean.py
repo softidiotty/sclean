@@ -17,7 +17,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1397,20 +1397,20 @@ def apply_update_and_restart(new_exe_path):
 # Тёмная цветовая схема
 # ============================================================
 
-DARK_BG = "#211c1c"
-DARK_BG_ALT = "#2c2424"
-DARK_FG = "#eae0e0"
-DARK_FG_DIM = "#a08e8e"
+DARK_BG = "#1e1e1f"
+DARK_BG_ALT = "#28282a"
+DARK_FG = "#e6e6e8"
+DARK_FG_DIM = "#9b9b9e"
 DARK_ACCENT = "#7a1620"
-DARK_ACCENT_TEXT = "#c9b6b6"
-DARK_ENTRY_BG = "#221c1c"
-DARK_BORDER = "#6e3b40"
+DARK_ACCENT_TEXT = "#f0d9d9"
+DARK_ENTRY_BG = "#242426"
+DARK_BORDER = "#4a4a4d"
 # Приглушённая нейтральная рамка для внешних границ 4 крупных блоков UI —
 # отдельная от DARK_BORDER (который используется для тонких разделителей
 # строк внутри блока 2). Нейтральный серый вместо яркого акцентного
 # цвета: блоки визуально разделены, но не конкурируют за внимание с
 # красной подсветкой выбранных пунктов.
-DARK_BLOCK_BORDER = "#4a4444"
+DARK_BLOCK_BORDER = "#4a4a4d"
 
 
 class Tooltip:
@@ -1642,11 +1642,52 @@ class CleanerApp:
         pad = {"padx": 10, "pady": 6}
 
         # ------------------------------------------------------------------
+        # Прокручиваемый контейнер для всего содержимого окна: Canvas +
+        # вертикальный Scrollbar. Нужен, чтобы при уменьшении окна ниже
+        # естественной высоты содержимого (например, на маленьких экранах
+        # моноблоков/планшетов) можно было прокрутить вниз колесом мыши
+        # или полосой прокрутки, вместо того чтобы часть интерфейса
+        # обрезалась и была недоступна. Все блоки 1-4 ниже крепятся не
+        # напрямую к self.root, а к scroll_frame внутри canvas.
+        # ------------------------------------------------------------------
+        outer_container = tk.Frame(self.root, bg=DARK_BG)
+        outer_container.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(outer_container, bg=DARK_BG, highlightthickness=0, bd=0)
+        v_scrollbar = ttk.Scrollbar(outer_container, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=v_scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        v_scrollbar.pack(side="right", fill="y")
+
+        scroll_frame = tk.Frame(self.canvas, bg=DARK_BG)
+        self._scroll_frame_window = self.canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+
+        def _update_scrollregion(_event=None):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+        def _sync_scroll_frame_width(event):
+            # Внутренний frame должен всегда иметь ширину canvas, иначе
+            # содержимое "плавает" при изменении размера окна.
+            self.canvas.itemconfigure(self._scroll_frame_window, width=event.width)
+
+        scroll_frame.bind("<Configure>", _update_scrollregion)
+        self.canvas.bind("<Configure>", _sync_scroll_frame_width)
+
+        def _on_mousewheel(event):
+            # Прокрутка колесом мыши в любом месте окна. delta положителен
+            # при прокрутке вверх на Windows — делим на 120 (шаг колеса) и
+            # инвертируем знак для естественного направления.
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # ------------------------------------------------------------------
         # Блок 1: заголовок/версия приложения, выбор пунктов, "выбрать все",
         # "рекомендуемые настройки". Обёрнут рамкой для визуального отделения
         # от остальных блоков интерфейса.
         # ------------------------------------------------------------------
-        block1_outer = tk.Frame(self.root, bg=DARK_BLOCK_BORDER, bd=0)
+        block1_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
         block1_outer.pack(fill="x", padx=10, pady=(10, 8))
         block1 = tk.Frame(block1_outer, bg=DARK_BG)
         block1.pack(fill="x", padx=2, pady=2)
@@ -1656,12 +1697,25 @@ class CleanerApp:
 
         self._logo_img = None
         try:
-            logo_path = resource_path("sclean_logo.png")
+            # Используем заранее подготовленный маленький PNG (64×64,
+            # пересчитан из исходника через качественный Lanczos-ресемплинг
+            # на этапе сборки), а не tk.PhotoImage.subsample() в рантайме —
+            # subsample делает грубое прореживание пикселей (ближайший
+            # сосед) и даёт заметно размытый/рваный результат на маленьком
+            # размере. 64px даёт запас под HiDPI-масштабирование, реальный
+            # размер в шапке ~32px задаётся через zoom/subsample 1:2 ниже.
+            logo_path = resource_path("sclean_logo_small.png")
+            if not os.path.isfile(logo_path):
+                logo_path = resource_path("sclean_logo.png")  # запасной вариант
             if os.path.isfile(logo_path):
                 raw = tk.PhotoImage(file=logo_path)
-                # Уменьшаем крупный PNG (256/512px) до размера иконки в шапке
-                factor = max(1, raw.width() // 32)
-                self._logo_img = raw.subsample(factor, factor)
+                if raw.width() > 40:
+                    # Подготовленный ассет 64px -> уменьшаем ровно в 2 раза
+                    # (целочисленный subsample на малом шаге почти не теряет
+                    # в качестве, в отличие от прореживания с 512px).
+                    self._logo_img = raw.subsample(2, 2)
+                else:
+                    self._logo_img = raw
                 ttk.Label(header_frame, image=self._logo_img, background=DARK_BG).pack(side="left", padx=(0, 8))
         except Exception:
             self._logo_img = None
@@ -1741,7 +1795,7 @@ class CleanerApp:
         # (3px) и осветлены для более чёткого визуального отделения блока
         # и строк друг от друга.
         # ------------------------------------------------------------------
-        steps_outer = tk.Frame(self.root, bg=DARK_BLOCK_BORDER, bd=0)
+        steps_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
         steps_outer.pack(fill="x", padx=10, pady=(0, 8))
 
         steps_frame = tk.Frame(steps_outer, bg=DARK_BG)
@@ -1768,7 +1822,7 @@ class CleanerApp:
         # Блок 3: основные действия — запуск всего отмеченного, отмена,
         # сворачивание в трей, открытие отчёта, бэкап.
         # ------------------------------------------------------------------
-        block3_outer = tk.Frame(self.root, bg=DARK_BLOCK_BORDER, bd=0)
+        block3_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
         block3_outer.pack(fill="x", padx=10, pady=(0, 8))
         block3 = tk.Frame(block3_outer, bg=DARK_BG)
         block3.pack(fill="x", padx=2, pady=2)
@@ -1796,10 +1850,10 @@ class CleanerApp:
         # Блок 4: процесс выполнения — статус, индикатор прогресса и журнал
         # выполняемых пунктов. Визуально отделён от блока с кнопками.
         # ------------------------------------------------------------------
-        block4_outer = tk.Frame(self.root, bg=DARK_BLOCK_BORDER, bd=0)
-        block4_outer.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        block4_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
+        block4_outer.pack(fill="x", padx=10, pady=(0, 8))
         block4 = tk.Frame(block4_outer, bg=DARK_BG)
-        block4.pack(fill="both", expand=True, padx=2, pady=2)
+        block4.pack(fill="x", padx=2, pady=2)
 
         progress_frame = ttk.Frame(block4)
         progress_frame.pack(fill="x", padx=8, pady=(8, 6))
@@ -1863,7 +1917,7 @@ class CleanerApp:
         self.log_text.tag_configure("summary", foreground=DARK_ACCENT_TEXT, font=(APP_FONT, 9, "bold"))
 
         # Футер
-        footer_frame = ttk.Frame(self.root)
+        footer_frame = ttk.Frame(scroll_frame)
         footer_frame.pack(fill="x", padx=10, pady=(0, 8))
         ttk.Label(footer_frame, text=f"{APP_NAME} build {APP_VERSION}  ·  автор: {APP_AUTHOR}",
                   style="Dim.TLabel").pack(side="right")

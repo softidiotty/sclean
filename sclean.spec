@@ -8,6 +8,7 @@ a = Analysis(
     datas=[
         ('sclean.ico', '.'),
         ('sclean_logo.png', '.'),
+        ('sclean_logo_small.png', '.'),
     ],
     hiddenimports=[],
     hookspath=[],
