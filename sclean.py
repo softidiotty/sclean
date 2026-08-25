@@ -7,6 +7,7 @@ import subprocess
 import datetime
 import threading
 import queue
+import webbrowser
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -17,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.9.7"
+APP_VERSION = "1.12.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -269,6 +270,21 @@ def get_free_space_gb(drive="C:\\"):
     try:
         total, used, free = shutil.disk_usage(drive)
         return round(free / (1024 ** 3), 2)
+    except Exception:
+        return None
+
+
+def get_disk_usage_info(drive="C:\\"):
+    """
+    Возвращает (used_gb, total_gb, percent_used) для индикатора заполнения
+    диска в шапке, или None при ошибке.
+    """
+    try:
+        total, used, free = shutil.disk_usage(drive)
+        total_gb = total / (1024 ** 3)
+        used_gb = used / (1024 ** 3)
+        percent = round(used / total * 100) if total else 0
+        return (round(used_gb, 1), round(total_gb, 1), percent)
     except Exception:
         return None
 
@@ -533,9 +549,38 @@ def backup_prefetch_snapshot(logf):
         pass
 
 
+def backup_services(logf, service_names):
+    """
+    Сохраняет текущий тип запуска (StartType) перечисленных служб перед
+    их отключением — чтобы восстановление возвращало ИМЕННО прежнее
+    значение (Automatic/Manual/Disabled), а не всегда одно и то же.
+    """
+    states = {}
+    for name in service_names:
+        out = run_ps(
+            f"try {{ (Get-Service -Name '{name}' -ErrorAction Stop).StartType.ToString() }} catch {{ '' }}"
+        )
+        val = out.strip()
+        if val:
+            states[name] = val
+    save_backup({"services_state": states})
+    logf(f"  Бэкап: тип запуска {len(states)} служб сохранён.")
+
+
+def backup_startup_apps(logf, disabled_entries):
+    """
+    Сохраняет список записей автозапуска, которые были отключены —
+    disabled_entries: список словарей {"kind": "registry"/"folder",
+    "hive": ..., "path": ..., "name": ..., "value": ...} — достаточно
+    информации, чтобы восстановить именно то, что было отключено.
+    """
+    save_backup({"startup_apps_disabled": disabled_entries})
+    logf(f"  Бэкап: {len(disabled_entries)} записей автозапуска сохранено для восстановления.")
+
+
 # Категории бэкапа, доступные для точечного восстановления (используется
 # и диалогом "Бэкап", и полным restore_from_backup).
-BACKUP_CATEGORIES = ("power_plan", "firewall", "visual_effects")
+BACKUP_CATEGORIES = ("power_plan", "firewall", "visual_effects", "services", "startup_apps")
 
 
 def restore_from_backup(logf, categories=None):
@@ -620,6 +665,57 @@ def restore_from_backup(logf, categories=None):
             logf("  Визуальные эффекты восстановлены (применятся после перезахода/перезапуска explorer.exe).")
         else:
             logf("  Визуальные эффекты: в бэкапе нет сохранённых значений.")
+
+    if "services" in categories:
+        services_state = data.get("services_state")
+        if services_state:
+            restored = 0
+            for name, start_type in services_state.items():
+                # Map .NET ServiceStartMode обратно на значение Set-Service
+                # -StartupType (те же строки для Automatic/Manual/Disabled).
+                out = run_ps(
+                    f"try {{ Set-Service -Name '{name}' -StartupType {start_type} -ErrorAction Stop; "
+                    "Write-Output OK } catch { Write-Output ('ERR:' + $_.Exception.Message) }"
+                )
+                if out.strip() == "OK":
+                    restored += 1
+            logf(f"  Службы: восстановлен тип запуска для {restored} из {len(services_state)}.")
+        else:
+            logf("  Службы: в бэкапе нет сохранённого состояния.")
+
+    if "startup_apps" in categories:
+        disabled_entries = data.get("startup_apps_disabled")
+        if disabled_entries:
+            restored = 0
+            for entry in disabled_entries:
+                try:
+                    if entry.get("kind") == "registry":
+                        hive = entry["hive"]
+                        reg_path = entry["path"]
+                        name = entry["name"]
+                        value = entry["value"]
+                        escaped_value = value.replace("'", "''")
+                        out = run_ps(
+                            f"try {{ if (-not (Test-Path '{hive}:\\{reg_path}')) "
+                            f"{{ New-Item -Path '{hive}:\\{reg_path}' -Force | Out-Null }}; "
+                            f"Set-ItemProperty -Path '{hive}:\\{reg_path}' -Name '{name}' -Value '{escaped_value}'; "
+                            "Write-Output OK } catch { Write-Output ('ERR:' + $_.Exception.Message) }"
+                        )
+                        if out.strip() == "OK":
+                            restored += 1
+                    elif entry.get("kind") == "folder":
+                        # Файлы папки автозагрузки перемещались в бэкап-подпапку
+                        # при отключении (см. step_startup_apps) — возвращаем обратно.
+                        src = entry.get("backup_path")
+                        dst = entry.get("original_path")
+                        if src and dst and os.path.isfile(src):
+                            shutil.move(src, dst)
+                            restored += 1
+                except Exception:
+                    continue
+            logf(f"  Автозапуск приложений: восстановлено {restored} из {len(disabled_entries)} записей.")
+        else:
+            logf("  Автозапуск приложений: в бэкапе нет сохранённых записей.")
 
     logf("Восстановление завершено.")
 
@@ -804,20 +900,65 @@ def step_defrag(logf):
 
 
 def step_power_plan(logf):
+    """
+    Активирует схему "Высокая производительность" и дополнительно
+    настраивает её под моноблоки/планшеты с iikoFront: система не должна
+    засыпать или гасить экран при простое (POS-терминал может стоять без
+    касаний подолгу между заказами, но должен быть готов сразу), а порты
+    USB не должны отключаться для экономии энергии (иначе периодически
+    отваливаются сканер штрихкодов, чековый принтер, фискальный
+    регистратор и подобная периферия, подключенная через USB).
+    """
     logf("Настройка электропитания: высокая производительность...")
     backup_power_plan(logf)
     HIGH_PERF_GUID = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
     code, out, err = run_cmd(f"powercfg /setactive {HIGH_PERF_GUID}", timeout=30)
     if code == 0:
         logf("  Схема активирована.")
-        return
-    logf("  Схема не найдена, создаём из шаблона...")
-    run_cmd(f"powercfg -duplicatescheme {HIGH_PERF_GUID}", timeout=30)
-    code2, out2, err2 = run_cmd(f"powercfg /setactive {HIGH_PERF_GUID}", timeout=30)
-    if code2 == 0:
-        logf("  Схема создана и активирована.")
     else:
-        logf(f"  Не удалось активировать (код {code2}): {err2 or err}")
+        logf("  Схема не найдена, создаём из шаблона...")
+        run_cmd(f"powercfg -duplicatescheme {HIGH_PERF_GUID}", timeout=30)
+        code2, out2, err2 = run_cmd(f"powercfg /setactive {HIGH_PERF_GUID}", timeout=30)
+        if code2 == 0:
+            logf("  Схема создана и активирована.")
+        else:
+            logf(f"  Не удалось активировать (код {code2}): {err2 or err}")
+
+    # Сон/гашение экрана при простое — отключаем и от сети, и от
+    # батареи (на планшетах может быть аккумулятор), чтобы моноблок
+    # никогда не засыпал сам по себе во время работы кассы.
+    idle_settings = [
+        ("standby-timeout-ac", "Сон (от сети)"),
+        ("standby-timeout-dc", "Сон (от батареи)"),
+        ("monitor-timeout-ac", "Отключение экрана (от сети)"),
+        ("monitor-timeout-dc", "Отключение экрана (от батареи)"),
+        ("disk-timeout-ac", "Отключение дисков (от сети)"),
+        ("disk-timeout-dc", "Отключение дисков (от батареи)"),
+    ]
+    idle_ok = True
+    for setting, label in idle_settings:
+        c, _, e = run_cmd(f"powercfg /change {setting} 0", timeout=15)
+        if c != 0:
+            idle_ok = False
+            logf(f"  {label}: не удалось отключить ({e})")
+    if idle_ok:
+        logf("  Сон и отключение экрана/дисков при простое отключены (всегда активен).")
+
+    # USB selective suspend — та самая галочка "Разрешить отключение
+    # этого устройства для экономии энергии" в диспетчере устройств,
+    # но выключенная централизованно через политику электропитания
+    # (действует для всех USB-концентраторов сразу). GUID подраздела
+    # USB settings / USB selective suspend setting — стандартные для
+    # всех схем Windows.
+    USB_SUBGROUP = "2a737441-1930-4402-8d77-b2bebba308a3"
+    USB_SETTING = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
+    c1, _, e1 = run_cmd(f"powercfg /setacvalueindex {HIGH_PERF_GUID} {USB_SUBGROUP} {USB_SETTING} 0", timeout=15)
+    c2, _, e2 = run_cmd(f"powercfg /setdcvalueindex {HIGH_PERF_GUID} {USB_SUBGROUP} {USB_SETTING} 0", timeout=15)
+    run_cmd(f"powercfg /setactive {HIGH_PERF_GUID}", timeout=15)
+    if c1 == 0 and c2 == 0:
+        logf("  Автоматическое отключение USB-портов для экономии энергии выключено.")
+    else:
+        logf(f"  Не удалось отключить USB selective suspend (коды {c1}/{c2}): {e1 or e2}")
 
 
 def step_firewall(logf):
@@ -879,6 +1020,165 @@ def step_visual_effects(logf):
         logf("  Не удалось подтвердить настройку сглаживания шрифтов.")
 
     logf("  Изменения вступят в силу после перезахода в систему или перезапуска explorer.exe.")
+
+
+# Службы Windows, безопасные для отключения на большинстве компьютеров и
+# конкретно на моноблоках/планшетах с iikoFront: намеренно НЕ включает
+# ничего, что может задеть POS-специфику, сеть, печать, звук, USB-периферию
+# (сканеры штрихкодов/чекпринтеры часто USB) или сам Windows Update.
+# Отключается только тип автозапуска (Disabled), а не остановка "навсегда" —
+# служба не запустится при следующей загрузке, но её можно запустить
+# вручную при необходимости, и восстановление возвращает исходный тип.
+SAFE_DISABLE_SERVICES = {
+    "Fax": "Факс",
+    "MapsBroker": "Загрузчик плиток карт Windows",
+    "RemoteRegistry": "Удалённый реестр",
+    "RetailDemo": "Демонстрационный режим витрины",
+    "WerSvc": "Служба регистрации ошибок Windows",
+    "diagnosticshub.standardcollector.service": "Служба сбора стандартной диагностики Microsoft (R)",
+    "DiagTrack": "Функциональные возможности подключённых пользователей и телеметрия",
+    "dmwappushservice": "Служба push-сообщений WAP",
+    "lfsvc": "Служба обнаружения местоположения",
+    "SharedAccess": "Общий доступ к подключению интернета (ICS)",
+    "TabletInputService": "Служба ввода планшетного ПК",
+    "WMPNetworkSvc": "Служба общего доступа к сети проигрывателя Windows Media",
+    "WSearch": "Windows Search (индексирование файлов)",
+}
+
+
+def get_service_startup_type(name):
+    """
+    Возвращает текущий StartupType службы ("Automatic"/"Manual"/
+    "Disabled"/...) или None, если служба не найдена в системе.
+    """
+    out = run_ps(f"try {{ (Get-Service -Name '{name}' -ErrorAction Stop).StartType.ToString() }} catch {{ '' }}")
+    val = out.strip()
+    return val if val else None
+
+
+def set_service_disabled(name, disabled):
+    """
+    Мгновенно переключает одну службу: disabled=True — останавливает и
+    ставит StartupType=Disabled; disabled=False — возвращает Manual
+    (безопасный дефолт для большинства служб из SAFE_DISABLE_SERVICES,
+    не запускает её принудительно, просто разрешает запуск по требованию).
+    Возвращает True при успехе, False при ошибке/отсутствии службы.
+    """
+    if disabled:
+        ps = (
+            f"try {{ Stop-Service -Name '{name}' -Force -ErrorAction SilentlyContinue; "
+            f"Set-Service -Name '{name}' -StartupType Disabled -ErrorAction Stop; "
+            "Write-Output OK } catch { Write-Output 'ERR' }"
+        )
+    else:
+        ps = (
+            f"try {{ Set-Service -Name '{name}' -StartupType Manual -ErrorAction Stop; "
+            "Write-Output OK } catch { Write-Output 'ERR' }"
+        )
+    out = run_ps(ps)
+    return out.strip() == "OK"
+
+
+def step_disable_services(logf, selected_names=None):
+    """
+    Отключает автозапуск выбранного набора служб — по умолчанию (если
+    selected_names не передан) используется весь безопасный список
+    SAFE_DISABLE_SERVICES, но GUI может передать конкретное подмножество,
+    если пользователь развернул пункт и снял отметки с части служб.
+    Каждая служба обрабатывается независимо — если одной из них нет в
+    системе (уже не установлена/зависит от редакции Windows), остальные
+    всё равно отключаются.
+    """
+    logf("Отключение автозапуска неиспользуемых служб Windows...")
+    names = list(selected_names) if selected_names is not None else list(SAFE_DISABLE_SERVICES.keys())
+    if not names:
+        logf("  Ни одна служба не выбрана — пропущено.")
+        return
+    backup_services(logf, names)
+
+    disabled_count = 0
+    skipped_count = 0
+    for name in names:
+        if set_service_disabled(name, True):
+            disabled_count += 1
+        else:
+            skipped_count += 1
+    logf(f"  Отключено служб: {disabled_count}, пропущено (не найдены в системе): {skipped_count}.")
+
+
+def step_restore_points(logf):
+    """
+    Удаляет старые точки восстановления системы (System Restore), оставляя
+    только самую свежую. На тесных SSD моноблоков (часто 64-128 ГБ) старые
+    точки восстановления могут занимать заметную часть места. Точки
+    восстановления не входят в бэкап sclean и не восстанавливаются им —
+    это отдельный, независимый механизм самой Windows.
+    """
+    logf("Очистка старых точек восстановления...")
+    out = run_ps(
+        "try { "
+        "$points = Get-ComputerRestorePoint -ErrorAction Stop | Sort-Object CreationTime; "
+        "if ($points.Count -le 1) { Write-Output 'NOTHING' } else { Write-Output $points.Count } "
+        "} catch { Write-Output 'UNSUPPORTED' }"
+    )
+    result = out.strip()
+    if result == "UNSUPPORTED":
+        logf("  Защита системы не включена или точки восстановления недоступны — пропущено.")
+        return
+    if result == "NOTHING" or not result:
+        logf("  Старых точек восстановления не найдено (0-1 точка) — нечего удалять.")
+        return
+
+    # vssadmin позволяет удалить все теневые копии диска C кроме самой
+    # свежей одной командой — проще и надёжнее, чем перебирать
+    # Get-ComputerRestorePoint по одной точке (нет прямого cmdlet для
+    # удаления конкретной точки без стороннего модуля).
+    code, cmd_out, err = run_cmd(
+        'vssadmin delete shadows /for=C: /oldest /quiet', timeout=120
+    )
+    logf(f"  Удаление старых теневых копий (было точек: {result}), код: {code}.")
+
+
+def step_usb_power_management(logf):
+    """
+    Отключает галочку "Разрешить отключение этого устройства для
+    экономии энергии" в диспетчере устройств для всех USB-концентраторов
+    и корневых USB-хабов — та же настройка, что видна в свойствах
+    устройства -> вкладка "Управление электропитанием". Отличается от
+    USB selective suspend в схеме электропитания (см. step_power_plan):
+    там политика применяется на уровне всей системы, а здесь — на
+    уровне конкретных устройств в реестре (EnhancedPowerManagementEnabled
+    под каждым USB-хабом), поэтому нужны обе настройки, чтобы порты
+    гарантированно не отключались (актуально для сканеров штрихкодов,
+    чековых принтеров и прочей периферии на моноблоках/планшетах).
+    """
+    logf("Отключение энергосбережения USB-портов (диспетчер устройств)...")
+    ps = (
+        "$count = 0; $touched = 0; "
+        "$hubs = Get-PnpDevice -Class 'USB' -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.FriendlyName -match 'Hub|Host Controller|Root' -or $_.Class -eq 'USB' }; "
+        "foreach ($hub in $hubs) { "
+        "  $count++; "
+        "  $key = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\' + $hub.InstanceId + '\\Device Parameters'; "
+        "  if (Test-Path $key) { "
+        "    try { "
+        "      Set-ItemProperty -Path $key -Name 'EnhancedPowerManagementEnabled' -Value 0 -Type DWord -ErrorAction Stop; "
+        "      $touched++; "
+        "    } catch {} "
+        "  } "
+        "}; "
+        "Write-Output ($count.ToString() + '|' + $touched.ToString())"
+    )
+    out = run_ps(ps, timeout=60)
+    parts = (out or "").strip().split("|")
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        found, touched = int(parts[0]), int(parts[1])
+        if found == 0:
+            logf("  USB-устройства не найдены — пропущено.")
+        else:
+            logf(f"  Найдено USB-устройств: {found}, энергосбережение отключено для {touched}.")
+    else:
+        logf("  Не удалось применить настройку через реестр — пропущено.")
 
 
 def _find_speedtest_cli():
@@ -994,120 +1294,44 @@ def step_internet_speed(logf):
     return "\n".join(result_lines)
 
 
-def step_system_info(logf):
-    logf("Сбор информации о системе...")
-    info_lines = []
-    info_lines.append(f"Отчёт о системе — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    info_lines.append("=" * 60)
+def get_quick_system_summary():
+    """
+    Быстрая сводка "ОС / CPU / RAM / материнская плата" для отображения
+    в шапке программы сразу при запуске — заменяет прежний отдельный
+    пункт списка "Сбор информации о системе", который собирал полный
+    отчёт (включая диски и видеокарту) и сохранял его в отдельный файл.
+    Теперь это не действие пользователя, а всегда видимая справка.
 
-    cpu = run_ps("(Get-CimInstance Win32_Processor | Select-Object -First 1).Name")
-    cpu_cores = run_ps("(Get-CimInstance Win32_Processor | Select-Object -First 1).NumberOfCores")
-    cpu_threads = run_ps("(Get-CimInstance Win32_Processor | Select-Object -First 1).NumberOfLogicalProcessors")
-    info_lines.append("\n[Процессор]")
-    info_lines.append(f"Модель: {cpu or 'не удалось определить'}")
-    info_lines.append(f"Физических ядер: {cpu_cores or '?'}")
-    info_lines.append(f"Логических потоков: {cpu_threads or '?'}")
-
-    ram_total = run_ps("[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)")
-    ram_speed = run_ps("(Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1).Speed")
-    ram_type_raw = run_ps("(Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1).SMBIOSMemoryType")
-    ram_modules = run_ps("(Get-CimInstance Win32_PhysicalMemory).Count")
-    info_lines.append("\n[Оперативная память]")
-    info_lines.append(f"Всего: {ram_total or '?'} ГБ")
-    info_lines.append(f"Количество модулей: {ram_modules or '?'}")
-    info_lines.append(f"Частота (первый модуль): {ram_speed or '?'} МГц")
-    info_lines.append(f"Код типа памяти (SMBIOSMemoryType): {ram_type_raw or '?'}")
-
-    info_lines.append("\n[Диски]")
-    disks_raw = run_ps(
-        "Get-CimInstance Win32_DiskDrive | ForEach-Object { "
-        "'{0} | {1}GB' -f $_.Model, ([math]::Round($_.Size/1GB,1)) }"
+    Один вызов PowerShell вместо нескольких отдельных — быстрее и не
+    задерживает старт GUI сильнее необходимого (всё равно выполняется в
+    фоновом потоке, см. CleanerApp._load_system_summary_async).
+    Возвращает словарь с ключами os/cpu/ram/board, значения — строки
+    "?" при неудаче отдельного запроса (не валит всю сводку целиком).
+    """
+    ps = (
+        "$osInfo = Get-CimInstance Win32_OperatingSystem; "
+        "$os = $osInfo.Caption; "
+        "$build = $osInfo.BuildNumber; "
+        "$ubr = (Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' -Name UBR "
+        "-ErrorAction SilentlyContinue).UBR; "
+        "$cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name; "
+        "$ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1); "
+        "$boardMaker = (Get-CimInstance Win32_BaseBoard).Manufacturer; "
+        "$boardModel = (Get-CimInstance Win32_BaseBoard).Product; "
+        "Write-Output ($os + '|' + $build + '.' + $ubr + '|' + $cpu + '|' + $ram + '|' + $boardMaker + ' ' + $boardModel)"
     )
-    if disks_raw:
-        for line in disks_raw.splitlines():
-            info_lines.append(f"Физический диск: {line.strip()}")
-    else:
-        info_lines.append("Не удалось получить список физических дисков.")
-
-    volumes_raw = run_ps(
-        "Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object { "
-        "'{0}: всего {1}GB, свободно {2}GB, тип {3}' -f $_.DriveLetter, "
-        "([math]::Round($_.Size/1GB,1)), ([math]::Round($_.SizeRemaining/1GB,1)), $_.FileSystem }"
-    )
-    if volumes_raw:
-        for line in volumes_raw.splitlines():
-            info_lines.append(f"Раздел {line.strip()}")
-    else:
-        info_lines.append("Не удалось получить список разделов.")
-
-    media_type_c = get_disk_media_type("C")
-    info_lines.append(f"Тип диска C: {media_type_c}")
-
-    # Видеокарта(ы)
-    info_lines.append("\n[Видеокарта]")
-    gpu_raw = run_ps(
-        "Get-CimInstance Win32_VideoController | ForEach-Object { "
-        "$vram = if ($_.AdapterRAM -gt 0) { '{0}GB' -f [math]::Round($_.AdapterRAM/1GB,1) } else { '?' }; "
-        "'{0} | VRAM: {1}' -f $_.Name, $vram }"
-    )
-    if gpu_raw:
-        for line in gpu_raw.splitlines():
-            name = line.strip()
-            name_lower = name.lower()
-            if any(k in name_lower for k in ("intel", "radeon(tm) graphics", "vega", "amd radeon graphics")) \
-               and not any(k in name_lower for k in ("rtx", "gtx", "geforce", "rx 5", "rx 6", "rx 7", "rx 9")):
-                kind = "встроенная"
-            elif "nvidia" in name_lower or "geforce" in name_lower or "rtx" in name_lower or "gtx" in name_lower:
-                kind = "дискретная"
-            elif "radeon" in name_lower:
-                kind = "дискретная (уточните вручную для APU)"
-            else:
-                kind = "не определено"
-            info_lines.append(f"{name} — {kind}")
-    else:
-        info_lines.append("Не удалось получить список видеокарт.")
-
-    # Материнская плата
-    info_lines.append("\n[Материнская плата]")
-    board_maker = run_ps("(Get-CimInstance Win32_BaseBoard).Manufacturer")
-    board_model = run_ps("(Get-CimInstance Win32_BaseBoard).Product")
-    info_lines.append(f"{(board_maker or '').strip()} {(board_model or '?').strip()}".strip())
-
-    # Устройство
-    device_name = run_ps("$env:COMPUTERNAME")
-    info_lines.append("\n[Устройство]")
-    info_lines.append(f"Имя устройства: {device_name or '?'}")
-
-    # ОС — расширенная информация (аналог "О системе" в параметрах Windows)
-    os_name = run_ps("(Get-CimInstance Win32_OperatingSystem).Caption")
-    os_build = run_ps("(Get-CimInstance Win32_OperatingSystem).BuildNumber")
-    os_ubr = run_ps(
-        "try { (Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' "
-        "-Name UBR -ErrorAction Stop).UBR } catch { '' }"
-    )
-    os_display_version = run_ps(
-        "try { (Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' "
-        "-Name DisplayVersion -ErrorAction Stop).DisplayVersion } catch { '' }"
-    )
-    os_install_date = run_ps(
-        "try { "
-        "  $d = (Get-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion' "
-        "  -Name InstallDate -ErrorAction Stop).InstallDate; "
-        "  ([DateTimeOffset]::FromUnixTimeSeconds($d)).LocalDateTime.ToString('dd.MM.yyyy') "
-        "} catch { '' }"
-    )
-    build_full = f"{os_build}.{os_ubr}" if (os_build and os_ubr) else (os_build or "?")
-
-    info_lines.append("\n[Операционная система]")
-    info_lines.append(f"Выпуск: {os_name or '?'}")
-    if os_display_version:
-        info_lines.append(f"Версия: {os_display_version}")
-    if os_install_date:
-        info_lines.append(f"Дата установки: {os_install_date}")
-    info_lines.append(f"Сборка ОС: {build_full}")
-
-    logf("Информация о системе собрана (см. верх отчёта).")
-    return "\n".join(info_lines)
+    out = run_ps(ps, timeout=15)
+    parts = (out or "").strip().split("|")
+    if len(parts) != 5:
+        return {"os": "?", "build": "?", "cpu": "?", "ram": "?", "board": "?"}
+    os_name, build, cpu, ram, board = (p.strip() for p in parts)
+    return {
+        "os": os_name or "?",
+        "build": build or "?",
+        "cpu": cpu or "?",
+        "ram": f"{ram} ГБ" if ram else "?",
+        "board": board or "?",
+    }
 
 
 # Реестр шагов: id -> (заголовок, функция, возвращает_текст, описание для
@@ -1148,21 +1372,47 @@ STEPS = [
      "Полностью отключает брандмауэр Windows во всех профилях (Domain/Private/Public).\n"
      "Текущее состояние сохраняется в бэкап и может быть восстановлено.",
      True, False, 3),
+    ("disable_services", "Отключить ненужные службы Windows", step_disable_services, False,
+     "Отключает автозапуск безопасного набора неиспользуемых системных служб\n"
+     "(факс, индексирование поиска, телеметрия, удалённый реестр и похожие) —\n"
+     "не трогает сеть, печать, звук, USB-устройства и ничего, что может быть\n"
+     "нужно POS-оборудованию. Тип запуска каждой службы сохраняется в бэкап.",
+     True, False, 10),
+    ("restore_points", "Очистка старых точек восстановления", step_restore_points, False,
+     "Удаляет старые точки восстановления системы, оставляя только самую свежую —\n"
+     "освобождает место на тесных SSD моноблоков. Не входит в бэкап sclean —\n"
+     "это отдельный, независимый механизм самой Windows.",
+     True, False, 15),
+    ("usb_power", "Отключить энергосбережение USB-портов", step_usb_power_management, False,
+     "Снимает галочку «Разрешить отключение этого устройства для экономии энергии»\n"
+     "в диспетчере устройств для всех USB-концентраторов — порты не будут отключаться\n"
+     "сами по себе. Важно для сканеров штрихкодов, чековых принтеров и другой\n"
+     "периферии на моноблоках/планшетах, которая иначе может периодически отваливаться.",
+     True, False, 10),
     ("internet_speed", "Проверка скорости интернет-соединения", step_internet_speed, True,
      "Измеряет скорость скачивания через Speedtest CLI (если найден) или резервным\n"
      "способом — скачиванием тестового файла.",
      True, False, 30),
-    ("system_info",    "Сбор информации о системе (CPU/RAM/диски/GPU/ОС)", step_system_info, True,
-     "Собирает сведения о процессоре, памяти, дисках, видеокарте, материнской плате\n"
-     "и версии Windows. Результат сохраняется в отдельный файл рядом с отчётом об\n"
-     "очистке, а не смешивается с ним.",
-     False, False, 5),
 ]
 
-# Информация о системе — обычный пункт списка (id "system_info"), но
-# результат его выполнения не идёт в общий текстовый отчёт об очистке —
-# _worker() отдельно перехватывает этот id и пишет результат в собственный
-# файл (см. _write_system_info_report).
+# Маленький значок слева от текста каждого пункта — чисто визуальная
+# подсказка типа действия (очистка/службы/диск/сеть и т.п.), не влияет ни
+# на что кроме отображения. Отдельный словарь, а не поле в кортеже STEPS,
+# чтобы не трогать arity кортежа и все места, где он распаковывается.
+STEP_ICONS = {
+    "clean_temp": "🧹",
+    "recycle_bin": "🗑",
+    "cleanmgr": "💽",
+    "sfc_dism": "🛡",
+    "defrag": "⚡",
+    "power_plan": "🔋",
+    "visual_fx": "🎨",
+    "firewall": "🧱",
+    "disable_services": "⚙",
+    "restore_points": "📍",
+    "usb_power": "🔌",
+    "internet_speed": "🌐",
+}
 
 # id пунктов, отмечаемых пресетом "рекомендуемые настройки" (безопасный
 # набор: без sfc/dism — долгий — и без отключения брандмауэра — рискованно).
@@ -1438,6 +1688,10 @@ DARK_BORDER = "#4a4a4d"
 # цвета: блоки визуально разделены, но не конкурируют за внимание с
 # красной подсветкой выбранных пунктов.
 DARK_BLOCK_BORDER = "#4a4a4d"
+# Акцент для ETA долгих пунктов (>60 сек) — тёплый жёлто-оранжевый,
+# заметный на тёмном фоне, но не конкурирующий с красным DARK_ACCENT
+# выбранных строк. Используется только для текста времени, не для фона.
+DARK_ETA_WARN = "#d9a441"
 
 
 class Tooltip:
@@ -1512,10 +1766,11 @@ class StepRow(tk.Frame):
     """
 
     def __init__(self, parent, text, variable, on_run_single, description="",
-                 risky=False, eta_sec=None, **kwargs):
+                 risky=False, eta_sec=None, on_toggle_expand=None, **kwargs):
         super().__init__(parent, bg=DARK_BG, **kwargs)
         self.variable = variable
         self.on_toggle_callback = None
+        self.eta_sec = eta_sec
 
         self.box_canvas = tk.Canvas(
             self, width=20, height=20, bg=DARK_BG, highlightthickness=0, bd=0
@@ -1551,6 +1806,24 @@ class StepRow(tk.Frame):
             self.eta_sep = None
             self.name_sep = None
 
+        # Кнопка разворачивания — только у пунктов, где передан
+        # on_toggle_expand (сейчас только "Отключить ненужные службы
+        # Windows"): показывает/скрывает панель с индивидуальными
+        # чекбоксами под строкой. Пакуется последней с side="right",
+        # поэтому оказывается левее блока ETA — явно отдельный элемент
+        # управления, а не часть строки времени выполнения. Своя
+        # подсветка (self.expanded) показывает, открыта ли панель сейчас,
+        # независимо от того, отмечен ли сам пункт.
+        self.expand_btn = None
+        self.expanded = False
+        if on_toggle_expand is not None:
+            self.expand_btn = tk.Label(
+                self, text="▸ Подробнее", bg=DARK_BG, fg=DARK_FG_DIM,
+                font=(APP_FONT, 8, "bold"), cursor="hand2", padx=6, pady=2,
+            )
+            self.expand_btn.pack(side="right", padx=(6, 10), pady=2)
+            self.expand_btn.bind("<Button-1>", lambda e: on_toggle_expand())
+
         tooltip_targets = [self, self.box_canvas, self.label]
         if self.eta_label is not None:
             tooltip_targets.append(self.eta_label)
@@ -1565,6 +1838,12 @@ class StepRow(tk.Frame):
         self.variable.set(not self.variable.get())
         self._draw()
 
+    def set_expand_arrow(self, expanded):
+        if self.expand_btn is not None:
+            self.expanded = expanded
+            self.expand_btn.configure(text=("▾ Подробнее" if expanded else "▸ Подробнее"))
+            self._draw()
+
     def _draw(self):
         checked = self.variable.get()
         row_bg = DARK_ACCENT if checked else DARK_BG
@@ -1574,7 +1853,27 @@ class StepRow(tk.Frame):
         self.box_canvas.configure(bg=row_bg)
         self.label.configure(bg=row_bg, fg=text_fg)
         if self.eta_label is not None:
-            self.eta_label.configure(bg=row_bg)
+            # Долгие пункты (>60 сек) выделяются тёплым жёлто-оранжевым
+            # цветом времени — сразу видно, какие займут больше времени,
+            # не читая каждую цифру отдельно. Только на обычном (не
+            # выбранном) фоне — на красном фоне выбранной строки желтизна
+            # плохо читается и конфликтует с акцентом выбора, там
+            # оставляем обычный светлый текст.
+            is_long = (self.eta_sec or 0) >= 60
+            if is_long and not checked:
+                eta_fg = DARK_ETA_WARN
+            else:
+                eta_fg = DARK_ACCENT_TEXT if checked else DARK_FG_DIM
+            self.eta_label.configure(bg=row_bg, fg=eta_fg)
+        if self.expand_btn is not None:
+            # Собственная подсветка: когда панель "Подробнее" раскрыта,
+            # кнопка выделяется тёплым акцентом (тем же, что и
+            # предупреждение по ETA) — видно, что панель открыта, даже
+            # если сама строка пункта не отмечена галочкой.
+            if self.expanded:
+                self.expand_btn.configure(bg=DARK_ETA_WARN, fg="#1a1a1a")
+            else:
+                self.expand_btn.configure(bg=row_bg, fg=(DARK_ACCENT_TEXT if checked else DARK_FG_DIM))
 
         self.box_canvas.delete("all")
         # Квадрат в том же стиле, что и мастер-чекбокс: всегда белый с
@@ -1746,15 +2045,125 @@ class CleanerApp:
         except Exception:
             self._logo_img = None
 
-        ttk.Label(header_frame, text=APP_NAME, style="Header.TLabel",
-                  font=(APP_FONT, 14, "bold")).pack(side="left")
-        ttk.Label(header_frame, text=f"  v{APP_VERSION}", style="Dim.TLabel").pack(side="left")
+        # Название программы и номер версии кликабельны: название ведёт на
+        # страницу самого последнего релиза на GitHub (удобно проверить,
+        # есть ли обновление, не открывая программу отдельно), а версия —
+        # на страницу именно этой, установленной версии (например, чтобы
+        # свериться со списком изменений конкретно этого билда). При
+        # наведении добавляется подчёркивание и более яркий цвет — иначе
+        # по виду не отличить от обычного текста, и то, что это ссылка,
+        # не очевидно.
+        def _make_link_label(parent, text, url, normal_fg, hover_fg, font_spec, side_pad=None):
+            underline_font = font_spec + ("underline",)
+            lbl = tk.Label(
+                parent, text=text, font=font_spec, fg=normal_fg, bg=DARK_BG,
+                cursor="hand2", bd=0,
+            )
+            if side_pad is not None:
+                lbl.pack(side="left", **side_pad)
+            else:
+                lbl.pack(side="left")
+            lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
+            lbl.bind("<Enter>", lambda e: lbl.configure(fg=hover_fg, font=underline_font))
+            lbl.bind("<Leave>", lambda e: lbl.configure(fg=normal_fg, font=font_spec))
+            return lbl
+
+        app_name_label = _make_link_label(
+            header_frame, APP_NAME,
+            f"https://github.com/{GITHUB_REPO}/releases/latest",
+            normal_fg=DARK_FG, hover_fg=DARK_ACCENT_TEXT, font_spec=(APP_FONT, 14, "bold"),
+        )
+        Tooltip(app_name_label, "Открыть страницу последнего релиза на GitHub")
+
+        version_label = _make_link_label(
+            header_frame, f"  v{APP_VERSION}",
+            f"https://github.com/{GITHUB_REPO}/releases/tag/v{APP_VERSION}",
+            normal_fg=DARK_FG_DIM, hover_fg=DARK_ACCENT_TEXT, font_spec=(APP_FONT, 9),
+        )
+        Tooltip(version_label, f"Открыть страницу релиза v{APP_VERSION} на GitHub")
 
         self.update_btn = ttk.Button(header_frame, text="Проверить обновление", command=self.check_update_clicked)
         self.update_btn.pack(side="right")
         self.update_status_label = ttk.Label(header_frame, text="", style="Dim.TLabel")
         self.update_status_label.pack(side="right", padx=(0, 8))
         self._pending_release = None
+
+        # Мини-индикатор заполнения диска C — сразу видно, насколько
+        # тесно на диске, не открывая проводник отдельно (актуально для
+        # моноблоков с маленькими SSD, где место — частый повод для
+        # запуска программы). Обновляется при старте и после каждого
+        # завершения набора пунктов (см. _refresh_disk_usage_label).
+        # Обёртка с рамкой — нужна, чтобы дать понятную визуальную
+        # обратную связь на клик (обычная подсветка hover/click на
+        # tk.Canvas+ttk.Label иначе незаметна, в отличие от кнопок и
+        # текстовых ссылок в шапке, где меняется цвет самого текста).
+        self.disk_usage_row = tk.Frame(block1, bg=DARK_BG, highlightthickness=1, highlightbackground=DARK_BORDER)
+        self.disk_usage_row.pack(fill="x", padx=8, pady=(2, 0))
+        disk_usage_inner = tk.Frame(self.disk_usage_row, bg=DARK_BG)
+        disk_usage_inner.pack(fill="x", padx=6, pady=3)
+        self.disk_usage_canvas = tk.Canvas(
+            disk_usage_inner, width=120, height=10, bg=DARK_ENTRY_BG, highlightthickness=0, bd=0,
+        )
+        self.disk_usage_canvas.pack(side="left", pady=2)
+        self.disk_usage_label = ttk.Label(disk_usage_inner, text="", style="Dim.TLabel", font=(APP_FONT, 8))
+        self.disk_usage_label.pack(side="left", padx=(6, 0))
+        self._refresh_disk_usage_label()
+
+        # Клик по индикатору открывает диск C: в проводнике. Hover
+        # подсвечивает рамку и фон акцентным цветом, а сам клик даёт
+        # короткую вспышку (_flash_disk_usage_row) — вместе понятно, что
+        # элемент кликабельный и клик сработал, даже без смены курсора.
+        def _disk_hover_on(_e=None):
+            self.disk_usage_row.configure(highlightbackground=DARK_ACCENT_TEXT, bg=DARK_BG_ALT)
+            disk_usage_inner.configure(bg=DARK_BG_ALT)
+            self.disk_usage_label.configure(background=DARK_BG_ALT)
+
+        def _disk_hover_off(_e=None):
+            self.disk_usage_row.configure(highlightbackground=DARK_BORDER, bg=DARK_BG)
+            disk_usage_inner.configure(bg=DARK_BG)
+            self.disk_usage_label.configure(background=DARK_BG)
+
+        def _disk_click(_e=None):
+            os.startfile("C:\\")
+            self._flash_disk_usage_row()
+
+        for widget in (self.disk_usage_row, disk_usage_inner, self.disk_usage_canvas, self.disk_usage_label):
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", _disk_click)
+            widget.bind("<Enter>", _disk_hover_on)
+            widget.bind("<Leave>", _disk_hover_off)
+            Tooltip(widget, "Открыть диск C: в проводнике")
+
+        # Кнопка автозагрузки: раньше "Оптимизация автозапуска" была
+        # отдельным пунктом списка, автоматически отключавшим известное
+        # ПО по жёстко зашитому списку (OneDrive/Skype/...) — заменена на
+        # прямое открытие обеих папок автозагрузки в проводнике, чтобы
+        # пользователь сам решал, что удалять/оставлять, без риска задеть
+        # что-то нужное на конкретном моноблоке.
+        startup_row = ttk.Frame(block1)
+        startup_row.pack(fill="x", padx=8, pady=(4, 0))
+        startup_btn = ttk.Button(
+            startup_row, text="🚀 Открыть папки автозагрузки", command=self._open_startup_folders,
+        )
+        startup_btn.pack(side="left")
+        Tooltip(
+            startup_btn,
+            "Открывает 2 папки автозагрузки в проводнике — для текущего пользователя\n"
+            "и для всех пользователей. Удалить ненужные ярлыки можно вручную.",
+        )
+
+        # Краткая сводка о системе (ОС/CPU/RAM/плата) — раньше это был
+        # отдельный пункт списка "Сбор информации о системе", теперь
+        # показывается сразу в шапке при запуске. Опрос идёт в фоновом
+        # потоке (Get-CimInstance занимает 1-3 сек), чтобы не морозить GUI.
+        system_summary_row = ttk.Frame(block1)
+        system_summary_row.pack(fill="x", padx=8, pady=(4, 6))
+        self.system_summary_label = ttk.Label(
+            system_summary_row, text="Сведения о системе: загрузка…",
+            style="Dim.TLabel", font=(APP_FONT, 8), wraplength=520, justify="left",
+        )
+        self.system_summary_label.pack(side="left", fill="x")
+        threading.Thread(target=self._load_system_summary_async, daemon=True).start()
 
         # Сворачиваемое краткое описание программы: что делает и где
         # сохраняется лог. Свёрнуто по умолчанию, чтобы не занимать место
@@ -1773,14 +2182,11 @@ class CleanerApp:
 
         log_dir_hint = os.path.join("Рабочий стол", "sclean")
         about_text = (
-            f"{APP_NAME} — программа для очистки временных файлов, оптимизации диска\n"
-            "и настроек Windows одним запуском. Каждый пункт списка ниже можно выполнить\n"
-            "по отдельности или всё выбранное сразу.\n\n"
-            f"Отчёт о каждом запуске (что выполнено, сколько места освобождено, скорость\n"
-            f"интернета, сведения о системе) сохраняется в папку \"{log_dir_hint}\" —\n"
-            "файл вида sclean_ГГГГ-ММ-ДД_ЧЧММСС.txt. Там же хранится файл бэкапа\n"
-            "изменённых настроек (sclean_backup.json) для восстановления через кнопку «Бэкап».\n"
-            "Старые отчёты (более 30 штук) удаляются автоматически."
+            f"{APP_NAME} — отмечаете нужные пункты списка ниже (или выполняете каждый\n"
+            "по отдельности) и запускаете: программа чистит систему и/или меняет\n"
+            "настройки Windows одним нажатием. Перед изменением настроек текущее\n"
+            "состояние сохраняется в бэкап — можно вернуть обратно кнопкой «Бэкап».\n"
+            f"Отчёт о каждом запуске сохраняется в папку \"{log_dir_hint}\"."
         )
         ttk.Label(
             self.about_frame, text=about_text, style="Dim.TLabel", justify="left",
@@ -1827,22 +2233,41 @@ class CleanerApp:
         steps_frame = tk.Frame(steps_outer, bg=DARK_BG)
         steps_frame.pack(fill="x", padx=2, pady=2)
 
+        # Выбранные для отключения службы из безопасного списка (id ->
+        # включена ли галочка в развёрнутой панели). По умолчанию все
+        # отмечены — соответствует прежнему поведению "весь набор".
+        self.services_selected = list(SAFE_DISABLE_SERVICES.keys())
+        self.services_panel = None
+        self.services_panel_expanded = False
+
         for idx, (step_id, title, _func, _ret, desc, _rec, risky, est_sec) in enumerate(STEPS):
             var = tk.BooleanVar(value=False)
             var.trace_add("write", lambda *args: self._sync_master_box())
             self.check_vars[step_id] = var
+            icon = STEP_ICONS.get(step_id, "")
+            row_text = f"{icon}  {title}" if icon else title
+
+            on_toggle_expand = None
+            if step_id == "disable_services":
+                on_toggle_expand = lambda sid=step_id: self._toggle_services_panel(steps_frame)
+
             row = StepRow(
-                steps_frame, title, var,
+                steps_frame, row_text, var,
                 on_run_single=lambda sid=step_id: self.run_single(sid),
                 description=desc, risky=risky, eta_sec=est_sec,
+                on_toggle_expand=on_toggle_expand,
             )
             row.pack(fill="x")
+            self.step_rows[step_id] = row
+
+            if step_id == "disable_services":
+                self.services_row = row
+
             if idx < len(STEPS) - 1:
                 # Тонкий разделитель (1px) — той же толщины, что и
                 # вертикальные разделители у ETA внутри строки.
                 sep = tk.Frame(steps_frame, bg=DARK_BORDER, height=1)
                 sep.pack(fill="x")
-            self.step_rows[step_id] = row
 
         # ------------------------------------------------------------------
         # Блок 3: основные действия — запуск всего отмеченного, отмена,
@@ -1884,10 +2309,21 @@ class CleanerApp:
         progress_frame = ttk.Frame(block4)
         progress_frame.pack(fill="x", padx=8, pady=(8, 6))
 
+        # Текст статуса и таймер — в одной строке; кнопка "Завершить
+        # очистку диска" — в СВОЕЙ отдельной строке ниже (а не справа в
+        # той же строке). Раньше при длинном тексте статуса (например,
+        # "Очистка диска работает в фоне (~42 сек) — закройте её окно,
+        # когда закончит, или нажмите «Завершить очистку диска»") и узком
+        # окне кнопка вытеснялась за пределы видимой области вместо
+        # переноса — казалось, что она пропала, хотя на деле просто не
+        # помещалась. wraplength на статусе + отдельная строка под кнопку
+        # гарантируют, что кнопка всегда видна независимо от ширины окна.
         status_row = ttk.Frame(progress_frame)
         status_row.pack(fill="x")
 
-        self.status_label = ttk.Label(status_row, text="Готово к запуску. 0%", font=(APP_FONT, 9))
+        self.status_label = ttk.Label(
+            status_row, text="Готово к запуску. 0%", font=(APP_FONT, 9), wraplength=520,
+        )
         self.status_label.pack(side="left", anchor="w")
 
         # Таймер общего времени выполнения — обновляется раз в секунду,
@@ -1898,11 +2334,16 @@ class CleanerApp:
         self.run_start_time = None
         self.timer_after_id = None
 
+        kill_cleanmgr_row = ttk.Frame(progress_frame)
+        kill_cleanmgr_row.pack(fill="x")
+
         # Кнопка принудительного завершения "Очистки диска" — видна, только
         # пока cleanmgr реально работает в фоне (см. _run_cleanmgr_async /
         # _on_cleanmgr_pid). Позволяет не ждать закрытия её окна вручную.
+        # В своей строке (а не справа от статуса) — не может быть обрезана
+        # или вытеснена за пределы окна длинным текстом статуса.
         self.kill_cleanmgr_btn = ttk.Button(
-            status_row, text="Завершить очистку диска", command=self._kill_cleanmgr,
+            kill_cleanmgr_row, text="Завершить очистку диска", command=self._kill_cleanmgr,
         )
         self.cleanmgr_pid = None
         # Мутабельный словарь (не bool) — чтобы замыкание внутри _worker
@@ -1911,6 +2352,16 @@ class CleanerApp:
 
         self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", maximum=100)
         self.progress.pack(fill="x", pady=4)
+
+        # Крупная сводка освобождённого места — появляется только после
+        # завершения набора пунктов, если реально что-то удалилось.
+        # Не .pack() здесь — показывается точечно через
+        # _show_freed_summary(), чтобы не занимать место, пока программа
+        # не запускалась ни разу за эту сессию.
+        self.freed_summary_label = tk.Label(
+            progress_frame, text="", bg=DARK_BG, fg=DARK_ACCENT_TEXT,
+            font=(APP_FONT, 16, "bold"),
+        )
 
         # Журнал (упрощённый): список выбранных пунктов с их статусом
         # выполнения (ожидание / выполняется / готово) — без построчных
@@ -1949,7 +2400,6 @@ class CleanerApp:
                   style="Dim.TLabel").pack(side="right")
 
         self.report_path = None
-        self.system_info_report_path = None
 
     def select_all(self):
         for step_id, var in self.check_vars.items():
@@ -1962,6 +2412,194 @@ class CleanerApp:
             var.set(False)
             self.step_rows[step_id]._draw()
         self._draw_master_box()
+
+    def _refresh_disk_usage_label(self):
+        """
+        Перерисовывает мини-индикатор заполнения диска C (полоска +
+        текст "X.X / Y.Y ГБ (Z%)"). Вызывается при старте программы и
+        после каждого завершения набора пунктов, чтобы отражать
+        актуальное место сразу после очистки, без перезапуска.
+        """
+        info = get_disk_usage_info("C:\\")
+        self.disk_usage_canvas.delete("all")
+        if info is None:
+            self.disk_usage_label.configure(text="Диск C: н/д")
+            return
+        used_gb, total_gb, percent = info
+
+        w, h = 120, 10
+        self.disk_usage_canvas.create_rectangle(0, 0, w, h, outline=DARK_BORDER, width=1, fill=DARK_ENTRY_BG)
+        fill_w = max(1, int(w * percent / 100))
+        # Заполнение >85% подсвечивается тем же тёплым акцентом, что и
+        # долгие пункты ETA — единая визуальная логика "внимание нужно
+        # сюда", не выдумывая ещё один цвет.
+        bar_color = DARK_ETA_WARN if percent >= 85 else DARK_ACCENT
+        self.disk_usage_canvas.create_rectangle(0, 0, fill_w, h, outline="", fill=bar_color)
+
+        self.disk_usage_label.configure(text=f"Диск C: {used_gb} / {total_gb} ГБ ({percent}%)")
+
+    def _flash_disk_usage_row(self):
+        """
+        Короткая вспышка рамки диска C (акцент -> обычная рамка) сразу
+        после клика — визуальное подтверждение "клик сработал", помимо
+        уже открывшегося окна проводника, которое может появиться не
+        мгновенно или свернуться за окно программы.
+        """
+        self.disk_usage_row.configure(highlightbackground=DARK_ACCENT, highlightthickness=2)
+        self.root.after(200, lambda: self.disk_usage_row.configure(
+            highlightbackground=DARK_BORDER, highlightthickness=1,
+        ))
+
+    def _open_startup_folders(self):
+        """
+        Открывает обе стандартные папки автозагрузки Windows в проводнике
+        (текущий пользователь + все пользователи) — пользователь сам
+        решает, что оставить или удалить, без риска автоматически задеть
+        что-то нужное на конкретном моноблоке/планшете.
+        """
+        user_folder = os.path.join(
+            os.getenv("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+        )
+        all_users_folder = os.path.join(
+            os.getenv("ProgramData", r"C:\ProgramData"),
+            "Microsoft", "Windows", "Start Menu", "Programs", "StartUp",
+        )
+        opened_any = False
+        for folder in (user_folder, all_users_folder):
+            if folder and os.path.isdir(folder):
+                try:
+                    os.startfile(folder)
+                    opened_any = True
+                except Exception:
+                    continue
+        if not opened_any:
+            messagebox.showwarning(
+                "Автозагрузка",
+                "Не удалось найти папки автозагрузки на этом компьютере.",
+            )
+
+    def _load_system_summary_async(self):
+        """
+        Выполняется в фоновом потоке при старте программы: собирает
+        краткую сводку ОС/CPU/RAM/материнской платы через PowerShell
+        (get_quick_system_summary) и передаёт результат в GUI-поток через
+        self.root.after, не блокируя окно на время опроса (1-3 сек).
+        Заменяет прежний отдельный пункт списка "Сбор информации о
+        системе" — теперь видно сразу, без запуска очистки.
+        """
+        summary = get_quick_system_summary()
+        text = (
+            f"🖥 {summary['os']} (сборка {summary['build']})   ·   ⚙ {summary['cpu']}   ·   "
+            f"🧠 {summary['ram']}   ·   🔧 {summary['board']}"
+        )
+        self.root.after(0, lambda: self.system_summary_label.configure(text=text))
+
+    def _toggle_services_panel(self, steps_frame):
+        """
+        Показывает/скрывает панель с индивидуальными чекбоксами для
+        каждой из 13 безопасных служб (SAFE_DISABLE_SERVICES), встроенную
+        сразу под строкой "Отключить ненужные службы Windows". Каждый
+        чекбокс отображает и меняет РЕАЛЬНОЕ текущее состояние службы в
+        системе сразу по клику (через set_service_disabled), а не только
+        то, что будет применено при следующем запуске пункта — так что
+        панель работает и как индивидуальный переключатель, независимо
+        от того, отмечен ли сам пункт в общем списке.
+        """
+        self.services_panel_expanded = not self.services_panel_expanded
+        self.services_row.set_expand_arrow(self.services_panel_expanded)
+
+        if not self.services_panel_expanded:
+            if self.services_panel is not None:
+                self.services_panel.pack_forget()
+            return
+
+        if self.services_panel is None:
+            panel = tk.Frame(steps_frame, bg=DARK_BG_ALT)
+            self.services_panel = panel
+
+            tk.Label(
+                panel, text="Каждый переключатель применяется сразу, независимо от запуска пункта:",
+                bg=DARK_BG_ALT, fg=DARK_FG_DIM, font=(APP_FONT, 8), anchor="w",
+            ).pack(fill="x", padx=(30, 8), pady=(6, 4))
+
+            self.service_row_vars = {}
+            for name, ru_label in SAFE_DISABLE_SERVICES.items():
+                self._build_service_toggle_row(panel, name, ru_label)
+
+        # pack(after=...) размещает панель СРАЗУ под строкой служб, даже
+        # если между ними уже есть другие виджеты (следующий разделитель) —
+        # без этого панель уехала бы в конец steps_frame.
+        self.services_panel.pack(fill="x", after=self.services_row)
+
+    def _build_service_toggle_row(self, parent, name, ru_label):
+        """
+        Одна строка внутри развёрнутой панели служб: маленький квадратный
+        чекбокс (тот же визуальный стиль, что и в остальной программе) +
+        русское название + техническое имя службы бледным шрифтом.
+        Состояние читается из системы при построении строки (через
+        get_service_startup_type) — если служба уже отключена вручную или
+        отсутствует в системе, чекбокс сразу покажет актуальное состояние.
+        """
+        current = get_service_startup_type(name)
+        is_disabled_now = current == "Disabled"
+        available = current is not None
+
+        # self.services_selected — список служб, которые будут отключены
+        # при запуске всего пункта "Отключить ненужные службы Windows"
+        # разом (через "Выполнить"/"Выполнить всё отмеченное"). Изначально
+        # включает весь безопасный набор; чекбокс здесь как включает
+        # службу немедленно в системе, так и убирает её из этого списка
+        # (или наоборот) — оба действия синхронизированы.
+        if not available and name in self.services_selected:
+            self.services_selected.remove(name)
+
+        row = tk.Frame(parent, bg=DARK_BG_ALT)
+        row.pack(fill="x", padx=(30, 8), pady=1)
+
+        var = tk.BooleanVar(value=(not is_disabled_now) and available)
+
+        box = tk.Canvas(row, width=16, height=16, bg=DARK_BG_ALT, highlightthickness=0, bd=0)
+        box.pack(side="left", padx=(0, 8), pady=2)
+
+        text = f"{ru_label}  ({name})" if available else f"{ru_label}  ({name}) — не найдена в системе"
+        fg = DARK_FG if available else DARK_FG_DIM
+        label = tk.Label(row, text=text, bg=DARK_BG_ALT, fg=fg, font=(APP_FONT, 8), anchor="w")
+        label.pack(side="left", fill="x", expand=True)
+
+        status_label = tk.Label(
+            row, text=("отключена" if is_disabled_now else "включена") if available else "",
+            bg=DARK_BG_ALT, fg=DARK_FG_DIM, font=(APP_FONT, 8),
+        )
+        status_label.pack(side="right", padx=(6, 4))
+
+        def draw():
+            box.delete("all")
+            outline = DARK_BORDER if available else DARK_FG_DIM
+            box.create_rectangle(1, 1, 15, 15, outline=outline, width=2, fill="#ffffff")
+            if var.get():
+                box.create_rectangle(4, 4, 12, 12, outline="", fill="#000000")
+
+        def toggle(_event=None):
+            if not available:
+                return
+            new_enabled = not var.get()
+            ok = set_service_disabled(name, not new_enabled)
+            if ok:
+                var.set(new_enabled)
+                status_label.configure(text="включена" if new_enabled else "отключена")
+                if new_enabled:
+                    if name in self.services_selected:
+                        self.services_selected.remove(name)
+                else:
+                    if name not in self.services_selected:
+                        self.services_selected.append(name)
+            draw()
+
+        if available:
+            box.bind("<Button-1>", toggle)
+            label.bind("<Button-1>", toggle)
+
+        draw()
 
     def _toggle_about(self):
         """
@@ -2242,12 +2880,16 @@ class CleanerApp:
             "power_plan": "Электропитание",
             "firewall": "Брандмауэр",
             "visual_effects": "Визуальные эффекты",
+            "services": "Службы Windows",
+            "startup_apps": "Автозапуск приложений",
         }
         availability = {
             "power_plan": bool(backup.get("power_plan_guid")),
             "firewall": bool(backup.get("firewall_state")),
             "visual_effects": any(backup.get(k) not in (None, "") for k in
                                    ("visual_fx_setting", "min_animate", "drag_full_windows")),
+            "services": bool(backup.get("services_state")),
+            "startup_apps": bool(backup.get("startup_apps_disabled")),
         }
         vars_map = {}
         for cat in BACKUP_CATEGORIES:
@@ -2289,6 +2931,7 @@ class CleanerApp:
         self.restore_btn.configure(state="disabled")
         self.cancel_btn.configure(state=("normal" if len(steps_to_run) > 1 else "disabled"))
         self.log_lines = []
+        self.freed_summary_label.pack_forget()
 
         self.current_steps = steps_to_run
         self.current_statuses = {s[0]: "pending" for s in steps_to_run}
@@ -2347,12 +2990,23 @@ class CleanerApp:
             self.status_label.configure(text="Отмена запрошена — завершится после текущего шага...")
 
     def _worker(self, steps_to_run):
-        def logf(msg):
-            # Шаги по-прежнему вызывают logf() по ходу выполнения, но
-            # отчёт больше не хранит построчный технический журнал —
-            # только сводку (что применено / место / скорость), поэтому
-            # здесь ничего не накапливается.
-            pass
+        # Каждый пункт получает свой собственный список строк — logf()
+        # внутри step_*-функций раньше просто отбрасывался, из-за чего
+        # отчёт показывал только общий статус "выполнено/ошибка", без
+        # деталей. Теперь строки накапливаются per-step через
+        # _make_logf(), а в конце попадают в step_results третьим
+        # элементом кортежа — то, что просил пользователь: что конкретно
+        # очистилось/включилось/отключилось и почему.
+        step_details = {}
+
+        def _make_logf(step_id):
+            lines = []
+            step_details[step_id] = lines
+
+            def logf(msg):
+                lines.append(str(msg))
+
+            return logf
 
         start_time = time.time()
         free_before = get_free_space_gb("C:\\")
@@ -2360,7 +3014,7 @@ class CleanerApp:
         collected_texts = []
         failures = []  # (title, причина) для шагов, завершившихся с ошибкой
         failures_lock = threading.Lock()
-        step_results = []  # (title, status) для всех выбранных пунктов, в отчёт
+        step_results = []  # (title, status, details) для всех выбранных пунктов, в отчёт
         step_results_lock = threading.Lock()
         cancelled = False
 
@@ -2373,13 +3027,10 @@ class CleanerApp:
         # ждёт его. Перед финальным отчётом мы дожидаемся завершения этого
         # потока, чтобы "Освобождено места" учитывало и его результат.
         cleanmgr_entry = None
-        system_info_entry = None
         other_steps = []
         for step in steps_to_run:
             if step[0] == "cleanmgr":
                 cleanmgr_entry = step
-            elif step[0] == "system_info":
-                system_info_entry = step
             else:
                 other_steps.append(step)
 
@@ -2401,19 +3052,20 @@ class CleanerApp:
                 return self.cleanmgr_stop_flag["stop"]
 
             def _run_cleanmgr_async():
+                cleanmgr_logf = _make_logf(cleanmgr_id)
                 try:
-                    result = cleanmgr_func(logf, on_pid=_on_cleanmgr_pid, should_stop=_cleanmgr_should_stop)
+                    result = cleanmgr_func(cleanmgr_logf, on_pid=_on_cleanmgr_pid, should_stop=_cleanmgr_should_stop)
                     if cleanmgr_returns_text and result:
                         collected_texts.append(result)
                     state = "cancelled" if self.cleanmgr_stop_flag["stop"] else "done"
                     self.msg_queue.put(("step_status", (cleanmgr_id, state)))
                     with step_results_lock:
-                        step_results.append((cleanmgr_title, state))
+                        step_results.append((cleanmgr_title, state, step_details.get(cleanmgr_id, [])))
                 except Exception as e:
                     with failures_lock:
                         failures.append((cleanmgr_title, str(e)))
                     with step_results_lock:
-                        step_results.append((cleanmgr_title, "error"))
+                        step_results.append((cleanmgr_title, "error", step_details.get(cleanmgr_id, [])))
                     self.msg_queue.put(("step_status", (cleanmgr_id, "error")))
 
             cleanmgr_thread = threading.Thread(target=_run_cleanmgr_async, daemon=True)
@@ -2425,7 +3077,7 @@ class CleanerApp:
                 cancelled = True
                 for rem_id, rem_title, *_r2 in other_steps[idx - 1:]:
                     self.msg_queue.put(("step_status", (rem_id, "cancelled")))
-                    step_results.append((rem_title, "cancelled"))
+                    step_results.append((rem_title, "cancelled", []))
                 break
 
             self.msg_queue.put(("step_status", (step_id, "running")))
@@ -2433,16 +3085,25 @@ class CleanerApp:
             eta = STEP_ESTIMATED_SEC.get(step_id)
             eta_txt = f"  (ожидается {format_eta(eta)})" if eta else ""
             self.msg_queue.put(("status", f"Выполняется: {title}  —  {pct_before}%{eta_txt}"))
+            step_logf = _make_logf(step_id)
             try:
-                result = func(logf)
+                if step_id == "disable_services":
+                    # Пункт можно развернуть в GUI и снять отметки с
+                    # отдельных служб — тогда выполняется только
+                    # выбранное подмножество, а не весь безопасный
+                    # список. self.services_selected обновляется
+                    # чекбоксами внутри развёрнутой панели.
+                    result = func(step_logf, selected_names=self.services_selected)
+                else:
+                    result = func(step_logf)
                 if returns_text and result:
                     collected_texts.append(result)
                 self.msg_queue.put(("step_status", (step_id, "done")))
-                step_results.append((title, "done"))
+                step_results.append((title, "done", step_details.get(step_id, [])))
             except Exception as e:
                 with failures_lock:
                     failures.append((title, str(e)))
-                step_results.append((title, "error"))
+                step_results.append((title, "error", step_details.get(step_id, [])))
                 self.msg_queue.put(("step_status", (step_id, "error")))
             pct_after = int(round(idx / total_other * 100)) if total_other else 100
             self.msg_queue.put(("progress", pct_after))
@@ -2462,56 +3123,23 @@ class CleanerApp:
                 ))
                 cleanmgr_thread.join(timeout=2)
 
-        # "Сбор информации о системе" — обычный пункт списка, выполняется
-        # только если отмечен пользователем. Результат не идёт в общий
-        # отчёт об очистке, а пишется в собственный отдельный файл.
-        system_info_path = None
-        if system_info_entry is not None and not cancelled:
-            si_id, si_title, si_func, si_returns_text = system_info_entry[:4]
-            self.msg_queue.put(("step_status", (si_id, "running")))
-            self.msg_queue.put(("status", f"Выполняется: {si_title}"))
-            try:
-                system_info_text = si_func(logf)
-                if si_returns_text and system_info_text:
-                    system_info_path = self._write_system_info_report(system_info_text)
-                self.msg_queue.put(("step_status", (si_id, "done")))
-                step_results.append((si_title, "done"))
-            except Exception as e:
-                with failures_lock:
-                    failures.append((si_title, str(e)))
-                step_results.append((si_title, "error"))
-                self.msg_queue.put(("step_status", (si_id, "error")))
-        elif system_info_entry is not None and cancelled:
-            step_results.append((system_info_entry[1], "cancelled"))
-
+        # Тексты, которые возвращают отдельные шаги (сейчас — только
+        # результат проверки скорости интернета) — попадают в отчёт
+        # отдельным блоком в конце, как и раньше.
         collected_system_info = "\n".join(collected_texts)
 
         free_after = get_free_space_gb("C:\\")
         elapsed = time.time() - start_time
+        freed_gb = None
+        if free_before is not None and free_after is not None:
+            freed_gb = round(free_after - free_before, 2)
 
         report_path = self._write_report(
             collected_system_info, free_before, free_after, elapsed, failures, cancelled, step_results
         )
         rotate_old_reports()
 
-        self.msg_queue.put(("done", (report_path, system_info_path, cancelled)))
-
-    def _write_system_info_report(self, system_info_text):
-        """
-        Пишет результат пункта "Сбор информации о системе" в отдельный
-        файл рядом с обычным отчётом об очистке — sclean_system_*.txt
-        вместо смешивания с sclean_*.txt, чтобы отчёт об очистке оставался
-        компактным, а системную информацию можно было прислать отдельно.
-        """
-        date_str = datetime.date.today().isoformat()
-        time_str = datetime.datetime.now().strftime("%H%M%S")
-        path = os.path.join(get_app_data_dir(), f"sclean_system_{date_str}_{time_str}.txt")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(system_info_text.strip() + "\n")
-        except Exception:
-            return None
-        return path
+        self.msg_queue.put(("done", (report_path, cancelled, freed_gb)))
 
     def _write_report(self, speed_text, free_before, free_after, elapsed_sec, failures, cancelled, step_results=None):
         date_str = datetime.date.today().isoformat()
@@ -2539,12 +3167,22 @@ class CleanerApp:
 
                 # Список всех выбранных пунктов и что с ними произошло —
                 # без этого раздела по отчёту нельзя понять, что вообще
-                # было отмечено к выполнению.
+                # было отмечено к выполнению. Под каждым пунктом —
+                # построчная детализация (что конкретно очистилось,
+                # включилось, отключилось и почему), собранная из вызовов
+                # logf() внутри самого шага, а не только итоговый статус.
                 if step_results:
                     f.write("Выбранные пункты:\n")
-                    for title, status in step_results:
+                    for entry in step_results:
+                        if len(entry) == 3:
+                            title, status, details = entry
+                        else:
+                            title, status = entry
+                            details = []
                         label = status_labels.get(status, status)
                         f.write(f"  [{label}] {title}\n")
+                        for line in details:
+                            f.write(f"      {line}\n")
                     f.write("\n")
 
                 # Причины невыполнения пунктов показываются, только если
@@ -2570,8 +3208,17 @@ class CleanerApp:
         return report_path
 
     def open_report(self):
-        if self.report_path and os.path.isfile(self.report_path):
-            os.startfile(self.report_path)
+        if not (self.report_path and os.path.isfile(self.report_path)):
+            return
+        # Открываем сам файл отчёта (в текстовом редакторе по умолчанию)
+        # и одновременно папку с ним в проводнике, с файлом выделенным —
+        # чтобы сразу было видно остальные отчёты/бэкап рядом, без
+        # отдельного похода в папку sclean на рабочем столе.
+        os.startfile(self.report_path)
+        try:
+            subprocess.Popen(["explorer.exe", f"/select,{self.report_path}"])
+        except Exception:
+            pass
 
     def _minimize_to_tray(self, auto=False):
         """
@@ -2619,18 +3266,28 @@ class CleanerApp:
                         self.cleanmgr_pid = None
                 elif kind == "cleanmgr_pid":
                     self.cleanmgr_pid = payload
-                    self.kill_cleanmgr_btn.pack(side="right")
+                    self.kill_cleanmgr_btn.pack(side="left", pady=(4, 0))
                 elif kind == "status":
                     self.status_label.configure(text=payload)
                 elif kind == "progress":
                     self.progress.configure(value=payload)
                 elif kind == "done":
-                    report_path, system_info_path, cancelled = payload
+                    report_path, cancelled, freed_gb = payload
                     self.report_path = report_path
-                    self.system_info_report_path = system_info_path
                     self.status_label.configure(text="Отменено." if cancelled else "Готово. 100%")
                     if not cancelled:
                         self.progress.configure(value=100)
+                    self._refresh_disk_usage_label()
+
+                    # Крупная сводка освобождённого места — только если
+                    # реально что-то освободилось (>0.05 ГБ, чтобы не
+                    # хвастаться округлением до нуля) и выполнение не было
+                    # отменено на полпути.
+                    if not cancelled and freed_gb is not None and freed_gb > 0.05:
+                        self.freed_summary_label.configure(text=f"✓ Освобождено {freed_gb} ГБ")
+                        self.freed_summary_label.pack(pady=(2, 4))
+                    else:
+                        self.freed_summary_label.pack_forget()
                     self.open_report_btn.configure(state="normal")
                     self.restore_btn.configure(state="normal")
                     self.cancel_btn.configure(state="disabled")
@@ -2655,8 +3312,6 @@ class CleanerApp:
                         )
                     else:
                         summary = f"Готово: все пункты выполнены успешно ({done_count} из {total_count})."
-                    if system_info_path:
-                        summary += f"\nИнформация о системе сохранена отдельно: {os.path.basename(system_info_path)}"
                     self._render_steps_panel(self.current_steps, self.current_statuses, summary=summary)
         except queue.Empty:
             pass
