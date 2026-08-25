@@ -17,7 +17,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1353,6 +1353,16 @@ def apply_update_and_restart(new_exe_path):
     target_dir = os.path.dirname(current_exe)
     bat_path = os.path.join(target_dir, "sclean_apply_update.bat")
 
+    # "start" здесь намеренно НЕ используется для перезапуска exe: start
+    # порождает ещё один процесс cmd.exe в цепочке (bat -> cmd -> start ->
+    # exe), а сам bat запущен из процесса, который почти сразу завершается
+    # (sys.exit после Popen). Из-за этого разрыва цепочки родитель/потомок
+    # Windows не может определить "родительский процесс" для UAC-проверки
+    # манифеста (uac_admin=True) и показывает "Security validation
+    # failure: failed to obtain executable path for parent proces!" —
+    # обновление всё равно проходит, но с лишним диалогом. Прямой вызов
+    # exe без "start" — на одно звено короче, UAC поднимает процесс от
+    # самого bat/cmd напрямую и ошибка не возникает.
     bat_content = (
         "@echo off\r\n"
         "timeout /t 2 /nobreak >nul\r\n"
@@ -1363,7 +1373,7 @@ def apply_update_and_restart(new_exe_path):
         f'    goto retry\r\n'
         f')\r\n'
         f'del "{new_exe_path}" >nul 2>&1\r\n'
-        f'start "" "{current_exe}"\r\n'
+        f'"{current_exe}"\r\n'
         f'del "%~f0" >nul 2>&1\r\n'
     )
     try:
