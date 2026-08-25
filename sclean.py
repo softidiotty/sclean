@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.1"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -999,20 +999,40 @@ def step_clean_temp(logf):
     if user:
         targets.append(("Кэш миниатюр Explorer", fr"C:\Users\{user}\AppData\Local\Microsoft\Windows\Explorer", 0))
 
+    # В журнал попадают только папки, где реально что-то удалено.
+    # Раньше печаталась строка на каждую из девяти папок, включая
+    # "удалено 0, пропущено 0" — это давало десяток строк шума на
+    # пункт, из которых полезны были одна-две.
     total_freed = 0
+    total_deleted = 0
+    total_skipped = 0
+    cleaned_labels = []
     for label, folder, min_age in targets:
         deleted, errors, freed = safe_delete_files_in(folder, min_age_minutes=min_age)
         total_freed += freed
-        logf(f"  {label}: удалено {deleted}, пропущено {errors}")
+        total_deleted += deleted
+        total_skipped += errors
+        if deleted:
+            cleaned_labels.append(f"{label} ({deleted})")
 
-    logf("Остановка службы wuauserv...")
     run_cmd("net stop wuauserv", timeout=30)
     deleted, errors, freed = safe_delete_files_in(r"C:\Windows\SoftwareDistribution\Download")
-    total_freed += freed
-    logf(f"  Кэш обновлений Windows: удалено {deleted}, ошибок {errors}")
     run_cmd("net start wuauserv", timeout=30)
-    logf("Служба wuauserv запущена обратно.")
-    logf(f"  Итого освобождено временными файлами: {format_bytes_gb(total_freed)} ГБ")
+    total_freed += freed
+    total_deleted += deleted
+    total_skipped += errors
+    if deleted:
+        cleaned_labels.append(f"кэш обновлений Windows ({deleted})")
+
+    # Объём здесь намеренно НЕ печатается: он уже выводится в заголовке
+    # пункта отчёта ("— освобождено X ГБ") и в общем итоге сверху.
+    # Раньше одно и то же число встречалось в отчёте трижды.
+    if cleaned_labels:
+        logf(f"  Очищено: {', '.join(cleaned_labels)}.")
+    logf(
+        f"  Удалено файлов: {total_deleted}"
+        + (f", занято другими процессами и пропущено: {total_skipped}." if total_skipped else ".")
+    )
     report_freed_bytes(logf, total_freed)
 
 
@@ -1040,11 +1060,12 @@ def step_recycle_bin(logf):
         timeout=60,
     )
     result = (out or "нет ответа").strip()
-    logf(f"  Результат: {result}")
-    if size_before > 0:
-        logf(f"  Освобождено очисткой корзины: {format_bytes_gb(size_before)} ГБ")
-        if result == "OK":
-            report_freed_bytes(logf, size_before)
+    if result != "OK":
+        logf(f"  Не удалось очистить корзину: {result}")
+    elif size_before > 0:
+        # Объём не дублируем — он в заголовке пункта отчёта.
+        logf("  Корзина очищена.")
+        report_freed_bytes(logf, size_before)
     else:
         logf("  Корзина была пуста.")
 
@@ -1723,20 +1744,167 @@ def step_usb_power_management(logf):
         logf("  устройств могла остаться отмеченной, хотя запрет на уровне системы записан.")
 
 
-def step_hardware_check(logf):
+def collect_hardware_diagnostics(logf=None):
     """
     Диагностика железа и периферии: ничего не меняет, только собирает
-    состояние и подсвечивает проблемы. Смысл пункта — на удалённом
-    моноблоке одним запуском увидеть то, ради чего обычно лезут в три
-    разных окна: не сыплется ли диск, не кончается ли место, все ли
-    устройства поднялись без ошибок и вся ли периферия на месте.
+    состояние и подсвечивает проблемы. Смысл — на удалённом моноблоке
+    сразу увидеть то, ради чего обычно лезут в три разных окна: не
+    сыплется ли диск, не кончается ли место, все ли устройства
+    поднялись без ошибок и вся ли периферия на месте.
 
-    Возвращает текст для отчёта (returns_text=True в STEPS), поэтому
-    подробности попадают и в файл, и в построчную детализацию пункта.
+    Раньше это был пункт списка задач, который нужно было отметить и
+    запустить. Теперь диагностика выполняется сама при старте программы
+    и показывается в шапке под сведениями о системе, поэтому функция
+    возвращает не только текст, но и список проблем отдельно —
+    интерфейсу нужно знать, сколько их, не разбирая текст обратно.
+
+    Возвращает (text, problems): готовый текст блока и список строк с
+    проблемами. logf необязателен — при вызове из фонового потока GUI
+    построчный журнал никому не нужен.
     """
+    if logf is None:
+        def logf(_msg):
+            pass
+
     logf("Диагностика железа и периферии...")
     lines = ["[Диагностика железа и периферии]"]
     problems = []
+
+    # --- Процессор: модель, ядра, загрузка, температура ---
+    # LoadPercentage берём как мгновенный срез: на кассе фоновая
+    # загрузка под 100% при простое — верный признак, что что-то
+    # зациклилось (антивирус, обновления, зависшая задача).
+    cpu_ps = (
+        "$c = Get-CimInstance Win32_Processor | Select-Object -First 1; "
+        "$t = ''; "
+        "try { "
+        "  $z = Get-CimInstance -Namespace root/WMI -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
+        "       Select-Object -First 1; "
+        "  if ($z) { $t = [math]::Round(($z.CurrentTemperature / 10) - 273.15, 1) } "
+        "} catch {}; "
+        "Write-Output \"$($c.Name)|$($c.NumberOfCores)|$($c.NumberOfLogicalProcessors)|"
+        "$($c.MaxClockSpeed)|$($c.LoadPercentage)|$t\""
+    )
+    cpu_out = run_ps(cpu_ps, timeout=60)
+    cpu_line = next((l.strip() for l in (cpu_out or "").splitlines() if "|" in l), "")
+    if cpu_line:
+        parts = [p.strip() for p in cpu_line.split("|")]
+        parts += [""] * (6 - len(parts))
+        name, cores, threads, mhz, load, temp = parts[:6]
+        detail = f"Процессор: {name}"
+        if cores and threads:
+            detail += f" — {cores} ядер / {threads} потоков"
+        if mhz:
+            detail += f", {mhz} МГц"
+        if load:
+            detail += f", загрузка {load}%"
+        if temp:
+            detail += f", {temp} °C"
+        else:
+            # MSAcpi_ThermalZoneTemperature на большинстве настольных
+            # плат не заполняется — это не ошибка сбора, поэтому пишем
+            # прямо, а не молча опускаем температуру.
+            detail += ", температура не отдаётся платой"
+        lines.append(detail)
+        logf(f"  {detail}")
+        try:
+            if load and int(load) >= 90:
+                problems.append(
+                    f"процессор загружен на {load}% — если это не рабочая нагрузка, "
+                    "проверьте, что зациклилось (антивирус, обновления, зависшая задача)"
+                )
+        except ValueError:
+            pass
+        try:
+            if temp and float(temp) >= 85:
+                problems.append(f"процессор горячий ({temp} °C) — проверьте охлаждение и запылённость")
+        except ValueError:
+            pass
+    else:
+        lines.append("Процессор: получить сведения не удалось.")
+        logf("  Процессор: получить сведения не удалось.")
+
+    # --- Оперативная память: объём, занято, модули ---
+    ram_ps = (
+        "$os = Get-CimInstance Win32_OperatingSystem; "
+        "$totalKb = $os.TotalVisibleMemorySize; $freeKb = $os.FreePhysicalMemory; "
+        "$mods = @(Get-CimInstance Win32_PhysicalMemory); "
+        "$slots = (Get-CimInstance Win32_PhysicalMemoryArray | "
+        "          Measure-Object -Property MemoryDevices -Sum).Sum; "
+        "$speeds = ($mods | ForEach-Object { $_.Speed }) -join ','; "
+        # ВАЖНО: строка собирается интерполяцией, а не через оператор "+".
+        # В PowerShell поведение "+" задаёт ЛЕВЫЙ операнд: $totalKb —
+        # число, поэтому "$totalKb + '|'" пытался преобразовать '|' в
+        # число, падал с ошибкой, и весь Write-Output не выполнялся.
+        # Из-за этого пункт сообщал "получить сведения не удалось", хотя
+        # процессор и диски (там первым идёт строка) собирались нормально.
+        "Write-Output \"$totalKb|$freeKb|$($mods.Count)|$slots|$speeds\""
+    )
+    ram_out = run_ps(ram_ps, timeout=60)
+    ram_line = next((l.strip() for l in (ram_out or "").splitlines() if "|" in l), "")
+    if ram_line:
+        parts = [p.strip() for p in ram_line.split("|")]
+        parts += [""] * (5 - len(parts))
+        total_kb, free_kb, mod_count, slots, speeds = parts[:5]
+        try:
+            total_gb = round(int(total_kb) / (1024 ** 2), 1)
+            free_ram_gb = round(int(free_kb) / (1024 ** 2), 1)
+            used_gb = round(total_gb - free_ram_gb, 1)
+            used_pct = (used_gb / total_gb * 100) if total_gb else 0
+            detail = f"Оперативная память: {used_gb} из {total_gb} ГБ занято ({used_pct:.0f}%)"
+            if mod_count:
+                detail += f", модулей {mod_count}"
+                if slots:
+                    detail += f" из {slots} слотов"
+            if speeds:
+                detail += f", частота {speeds} МГц"
+            lines.append(detail)
+            logf(f"  {detail}")
+            if used_pct >= 90:
+                problems.append(
+                    f"оперативная память занята на {used_pct:.0f}% — система уходит в файл "
+                    "подкачки и заметно тормозит"
+                )
+        except (ValueError, ZeroDivisionError):
+            lines.append("Оперативная память: получить сведения не удалось.")
+            logf("  Оперативная память: получить сведения не удалось.")
+    else:
+        lines.append("Оперативная память: получить сведения не удалось.")
+        logf("  Оперативная память: получить сведения не удалось.")
+
+    # --- Результаты встроенной диагностики памяти Windows ---
+    # Windows пишет результат mdsched.exe в журнал событий. Если тест
+    # когда-либо находил ошибки — это самое важное, что можно сказать
+    # про память, и это стоит показать явно.
+    mem_ps = (
+        "try { "
+        "  $e = Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-MemoryDiagnostics-Results'} "
+        "       -MaxEvents 1 -ErrorAction Stop; "
+        "  Write-Output ($e.TimeCreated.ToString('yyyy-MM-dd') + '|' + $e.Id + '|' + ($e.Message -replace '\\r?\\n', ' ')) "
+        "} catch { Write-Output 'NONE' }"
+    )
+    mem_out = (run_ps(mem_ps, timeout=60) or "").strip()
+    mem_line = next((l.strip() for l in mem_out.splitlines() if "|" in l), "")
+    if mem_line:
+        date_s, _, rest = mem_line.partition("|")
+        event_id, _, message = rest.partition("|")
+        # Показываем вывод одним словом-вердиктом, а не куском текста
+        # события на 160 символов: подробности всё равно ничего не
+        # добавляют, а место занимали заметное.
+        # Id 1202 — тест нашёл ошибки, 1201 — прошёл чисто.
+        bad = (event_id.strip() == "1202" or "обнаруж" in message.lower()
+               or "error" in message.lower())
+        verdict = "обнаружены ошибки" if bad else "ошибок не найдено"
+        lines.append(f"Тест памяти Windows: {verdict} (проверка от {date_s})")
+        logf(f"  Тест памяти Windows от {date_s}: {verdict}.")
+        if bad:
+            problems.append(
+                "встроенный тест памяти Windows сообщал об ошибках — "
+                "стоит проверить модули памяти (mdsched.exe)"
+            )
+    else:
+        lines.append("Тест памяти Windows: не запускался (mdsched.exe).")
+        logf("  Тест памяти Windows ранее не запускался.")
 
     # --- Диски: здоровье, тип, температура ---
     disk_ps = (
@@ -1774,8 +1942,11 @@ def step_hardware_check(logf):
     vol_ps = (
         "foreach ($v in @(Get-Volume -ErrorAction SilentlyContinue | "
         "  Where-Object { $_.DriveLetter -and $_.Size -gt 0 })) { "
-        "  Write-Output ($v.DriveLetter + '|' + [math]::Round($v.Size / 1GB, 1) + '|' + "
-        "                [math]::Round($v.SizeRemaining / 1GB, 1)) "
+        # Интерполяция вместо "+": DriveLetter — это char, а не строка,
+        # и оператор "+" в PowerShell по левому операнду ушёл бы в
+        # числовое сложение (та же ловушка, что сломала сбор о памяти).
+        "  Write-Output \"$($v.DriveLetter)|$([math]::Round($v.Size / 1GB, 1))|"
+        "$([math]::Round($v.SizeRemaining / 1GB, 1))\" "
         "}"
     )
     vol_out = run_ps(vol_ps, timeout=60)
@@ -1822,31 +1993,11 @@ def step_hardware_check(logf):
         lines.append("Устройства с ошибками: нет.")
         logf("  Устройств с ошибками в диспетчере нет.")
 
-    # --- Подключённая USB-периферия ---
-    usb_ps = (
-        "foreach ($d in @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | "
-        "  Where-Object { $_.InstanceId -like 'USB*' -and $_.Class -notin @('USB') })) { "
-        "  Write-Output ($d.FriendlyName + '|' + $d.Class) "
-        "}"
-    )
-    usb_out = run_ps(usb_ps, timeout=90)
-    peripherals = []
-    for line in (usb_out or "").splitlines():
-        line = line.strip()
-        if not line or "|" not in line:
-            continue
-        name, _, cls = line.partition("|")
-        name = name.strip()
-        if name:
-            peripherals.append(f"{name} ({cls.strip() or 'без класса'})")
-    if peripherals:
-        lines.append(f"Подключённая USB-периферия ({len(peripherals)}):")
-        logf(f"  Подключённая USB-периферия: {len(peripherals)} устройств.")
-        for item in peripherals[:25]:
-            lines.append(f"  - {item}")
-    else:
-        lines.append("Подключённая USB-периферия: не обнаружена.")
-        logf("  USB-периферия не обнаружена.")
+    # Список подключённой USB-периферии здесь раньше выводился целиком
+    # (15+ строк вида "USB-устройство ввода") — он занимал больше места,
+    # чем всё остальное вместе, и ничего не говорил: имена у HID-устройств
+    # обезличенные. Убран: что подключено, видно в диспетчере устройств,
+    # а для диагностики важны только устройства С ОШИБКАМИ (выше).
 
     # --- Итог ---
     if problems:
@@ -1861,7 +2012,7 @@ def step_hardware_check(logf):
         lines.append("Проблем не обнаружено.")
         logf("  Проблем не обнаружено.")
 
-    return "\n".join(lines)
+    return "\n".join(lines), problems
 
 
 def _find_speedtest_cli():
@@ -2080,12 +2231,6 @@ STEPS = [
      "сами по себе. Важно для сканеров штрихкодов, чековых принтеров и другой\n"
      "периферии на моноблоках/планшетах, которая иначе может периодически отваливаться.",
      True, False, 10),
-    ("hardware_check", "Диагностика железа и периферии", step_hardware_check, True,
-     "Ничего не меняет — только проверяет и пишет результат в отчёт: состояние (SMART)\n"
-     "и температуру дисков, свободное место по всем разделам, устройства с ошибками\n"
-     "в диспетчере устройств и список подключённой USB-периферии.\n"
-     "Проблемы выносятся отдельным списком «Требует внимания».",
-     True, False, 30),
     ("internet_speed", "Проверка скорости интернет-соединения", step_internet_speed, True,
      "Измеряет скорость скачивания через Speedtest CLI (если найден) или резервным\n"
      "способом — скачиванием тестового файла.",
@@ -2109,12 +2254,15 @@ STEP_ICONS = {
     "restore_points": "📍",
     "cleanmgr_deep": "📦",
     "usb_power": "🔌",
-    "hardware_check": "🩺",
     "internet_speed": "🌐",
 }
 
-# id пунктов, отмечаемых пресетом "рекомендуемые настройки" (безопасный
-# набор: без sfc/dism — долгий — и без отключения брандмауэра — рискованно).
+# id пунктов, отмечаемых пресетом "рекомендуемые настройки" — берутся из
+# поля recommended самих STEPS. Сейчас не отмечаются только два самых
+# долгих пункта: "Проверка системы: sfc/DISM" и "Глубокая очистка
+# обновлений Windows" (каждый до 15+ минут). Отключение брандмауэра в
+# набор ВХОДИТ — на моноблоках с iikoFront это штатная настройка
+# (см. историю правок), поэтому старая оговорка про него убрана.
 RECOMMENDED_STEP_IDS = {s[0] for s in STEPS if s[5]}
 RISKY_STEP_IDS = {s[0] for s in STEPS if s[6]}
 STEP_ESTIMATED_SEC = {s[0]: s[7] for s in STEPS}
@@ -2907,7 +3055,10 @@ class CleanerApp:
         self.system_summary_text.bind("<Key>", _summary_keypress)
         self.system_summary_text.bind("<Control-a>", lambda e: (
             self.system_summary_text.tag_add("sel", "1.0", "end-1c"), "break")[1])
-        Tooltip(self.system_summary_text, "Текст можно выделить мышью и скопировать (Ctrl+C)")
+        # Подсказки при наведении здесь намеренно нет: всплывающее окно
+        # перекрывало сам текст сводки ровно в тот момент, когда его
+        # пытаются выделить мышью. Про возможность копирования говорит
+        # кнопка "Копировать" рядом.
 
         self.copy_summary_btn = ttk.Button(
             system_summary_row, text="Копировать", width=12, command=self._copy_system_summary,
@@ -2916,6 +3067,50 @@ class CleanerApp:
         Tooltip(self.copy_summary_btn, "Скопировать сведения о системе в буфер обмена")
 
         threading.Thread(target=self._load_system_summary_async, daemon=True).start()
+
+        # Диагностика железа и периферии. Раньше была пунктом списка
+        # задач, который нужно отметить и запустить — но она ничего не
+        # меняет, только смотрит, поэтому логичнее ей быть рядом со
+        # сведениями о системе и выполняться самой при старте.
+        # В свёрнутом виде — одна строка с итогом (или числом проблем),
+        # по кнопке разворачивается полный текст.
+        diag_row = tk.Frame(block1, bg=DARK_BG)
+        diag_row.pack(fill="x", padx=8, pady=(0, 2))
+        self.diag_status_label = tk.Label(
+            diag_row, text="🩺 Диагностика железа: проверка…", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 8), anchor="w", justify="left",
+        )
+        self.diag_status_label.pack(side="left")
+
+        self.diag_toggle_btn = tk.Label(
+            diag_row, text="▸ Подробнее", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 8, "bold"), cursor="hand2", padx=6, pady=1,
+        )
+        self.diag_toggle_btn.bind("<Button-1>", lambda e: self._toggle_diag_details())
+        self.diag_toggle_btn.bind("<Enter>", lambda e: self.diag_toggle_btn.configure(
+            bg=DARK_BG_ALT, fg=DARK_ETA_WARN) if not self._diag_expanded else None)
+        self.diag_toggle_btn.bind("<Leave>", lambda e: self._draw_diag_toggle())
+        # Кнопка появляется только когда диагностика закончится — до тех
+        # пор разворачивать нечего.
+
+        self.diag_details_frame = tk.Frame(block1, bg=DARK_BG)
+        # height задаётся динамически по фактическому числу строк (см.
+        # _apply_hardware_diagnostics): после того как из блока убрали
+        # список USB-периферии, он помещается целиком, и прокрутка
+        # больше не нужна — а именно на неё жаловались.
+        self.diag_details_text = tk.Text(
+            self.diag_details_frame, height=8, wrap="word", font=(APP_FONT, 8),
+            bg=DARK_ENTRY_BG, fg=DARK_FG_DIM, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=DARK_BORDER, insertwidth=0, cursor="xterm",
+            selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
+        )
+        self.diag_details_text.pack(fill="both", expand=True, padx=2, pady=2)
+        self.diag_details_text.bind("<Key>", _summary_keypress)
+
+        self._diag_expanded = False
+        self._diag_text = ""
+        self._diag_problems = []
+        threading.Thread(target=self._load_hardware_diagnostics_async, daemon=True).start()
 
         # Сворачиваемое краткое описание программы: что делает и где
         # сохраняется лог. Свёрнуто по умолчанию, чтобы не занимать место
@@ -2967,7 +3162,14 @@ class CleanerApp:
 
         preset_btn = ttk.Button(master_frame, text="Рекомендуемые настройки", command=self.select_recommended)
         preset_btn.pack(side="right")
-        Tooltip(preset_btn, "Отметить безопасный набор пунктов: без длительной проверки\nsfc/DISM и без отключения брандмауэра.")
+        Tooltip(
+            preset_btn,
+            "Отметить обычный набор для обслуживания: очистка, оптимизация диска,\n"
+            "электропитание, службы, USB и диагностика.\n\n"
+            "Не отмечаются два самых долгих пункта — «Проверка системы: sfc/DISM»\n"
+            "и «Глубокая очистка обновлений Windows»: каждый может занять\n"
+            "15 минут и более, их отмечают вручную, когда есть время.",
+        )
 
         self._draw_master_box()
 
@@ -3254,6 +3456,64 @@ class CleanerApp:
         """
         self.system_summary_text.delete("1.0", "end")
         self.system_summary_text.insert("1.0", text)
+
+    def _load_hardware_diagnostics_async(self):
+        """
+        Фоновый сбор диагностики железа при старте программы. Занимает
+        несколько секунд (несколько запросов к WMI), поэтому выполняется
+        вне GUI-потока, а результат отдаётся в интерфейс через after().
+        """
+        try:
+            text, problems = collect_hardware_diagnostics()
+        except Exception as e:
+            text, problems = f"Не удалось выполнить диагностику: {e}", []
+        self.root.after(0, lambda: self._apply_hardware_diagnostics(text, problems))
+
+    def _apply_hardware_diagnostics(self, text, problems):
+        """
+        Показывает итог диагностики в шапке: одна строка со сводкой и
+        кнопка разворачивания полного текста. Строка подсвечивается
+        тёплым акцентом, если что-то требует внимания — тем же цветом,
+        что и долгие пункты и переполненный диск.
+        """
+        self._diag_text = text
+        self._diag_problems = problems
+
+        if problems:
+            word = "проблема" if len(problems) == 1 else (
+                "проблемы" if 2 <= len(problems) <= 4 else "проблем")
+            self.diag_status_label.configure(
+                text=f"🩺 Диагностика железа: {len(problems)} {word} — требует внимания",
+                fg=DARK_ETA_WARN,
+            )
+        else:
+            self.diag_status_label.configure(
+                text="🩺 Диагностика железа: проблем не обнаружено", fg=DARK_FG_DIM,
+            )
+
+        self.diag_details_text.delete("1.0", "end")
+        self.diag_details_text.insert("1.0", text)
+        # Подгоняем высоту под содержимое, чтобы блок показывался
+        # целиком и не приходилось его листать. Потолок 20 строк — на
+        # случай, если устройств с ошибками окажется необычно много.
+        line_count = text.count("\n") + 1
+        self.diag_details_text.configure(height=min(max(line_count, 4), 20))
+        self.diag_toggle_btn.pack(side="left", padx=(8, 0))
+        self._draw_diag_toggle()
+
+    def _draw_diag_toggle(self):
+        if self._diag_expanded:
+            self.diag_toggle_btn.configure(text="▾ Подробнее", bg=DARK_ETA_WARN, fg="#1a1a1a")
+        else:
+            self.diag_toggle_btn.configure(text="▸ Подробнее", bg=DARK_BG, fg=DARK_FG_DIM)
+
+    def _toggle_diag_details(self):
+        self._diag_expanded = not self._diag_expanded
+        if self._diag_expanded:
+            self.diag_details_frame.pack(fill="x", padx=8, pady=(0, 6))
+        else:
+            self.diag_details_frame.pack_forget()
+        self._draw_diag_toggle()
 
     def _copy_system_summary(self):
         """
@@ -3927,11 +4187,11 @@ class CleanerApp:
                 ))
                 cleanmgr_thread.join(timeout=2)
 
-        # Тексты, которые возвращают отдельные шаги (сейчас — только
-        # результат проверки скорости интернета) — попадают в отчёт
-        # отдельным блоком в конце, как и раньше.
-        collected_system_info = "\n".join(collected_texts)
-
+        # Отдельного блока с текстами шагов в конце отчёта больше нет:
+        # результат проверки скорости и так печатался построчно внутри
+        # своего пункта, а в конце дублировался почти дословно. Тексты
+        # по-прежнему собираются (шаги их возвращают), но в отчёт не
+        # выводятся — вся информация уже есть в детализации пунктов.
         free_after = get_free_space_gb("C:\\")
         elapsed = time.time() - start_time
 
@@ -3945,15 +4205,18 @@ class CleanerApp:
             delta_gb = round(free_after - free_before, 2)
 
         report_path = self._write_report(
-            collected_system_info, free_before, free_after, elapsed, failures, cancelled,
+            free_before, free_after, elapsed, failures, cancelled,
             step_results, step_freed, freed_gb, delta_gb,
         )
         rotate_old_reports()
 
         self.msg_queue.put(("done", (report_path, cancelled, freed_gb)))
 
-    def _write_report(self, speed_text, free_before, free_after, elapsed_sec, failures, cancelled,
+    def _write_report(self, free_before, free_after, elapsed_sec, failures, cancelled,
                       step_results=None, step_freed=None, freed_total_gb=None, delta_gb=None):
+        # speed_text больше не принимается: результат проверки скорости
+        # печатался и в детализации своего пункта, и отдельным блоком в
+        # конце отчёта — второе было дословным повтором первого.
         date_str = datetime.date.today().isoformat()
         time_str = datetime.datetime.now().strftime("%H%M%S")
         report_path = os.path.join(get_app_data_dir(), f"sclean_{date_str}_{time_str}.txt")
@@ -3974,68 +4237,67 @@ class CleanerApp:
                 f.write(f"{APP_NAME} build {APP_VERSION}  ·  автор: {APP_AUTHOR}\n")
                 f.write("=" * 60 + "\n\n")
 
-                if cancelled:
-                    f.write("Внимание: выполнение было прервано пользователем (отмена).\n\n")
+                # ИТОГ идёт первым: раньше отчёт начинался с длинного
+                # списка пунктов, и главные цифры (сколько освободили,
+                # сколько заняло) приходилось искать в самом низу.
+                results = list(step_results or [])
+                done_n = sum(1 for e in results if e[1] == "done")
+                err_n = sum(1 for e in results if e[1] == "error")
+                cancel_n = sum(1 for e in results if e[1] == "cancelled")
 
-                # Список всех выбранных пунктов и что с ними произошло —
-                # без этого раздела по отчёту нельзя понять, что вообще
-                # было отмечено к выполнению. Под каждым пунктом —
-                # построчная детализация (что конкретно очистилось,
-                # включилось, отключилось и почему), собранная из вызовов
-                # logf() внутри самого шага, а не только итоговый статус.
-                if step_results:
-                    f.write("Выбранные пункты:\n")
-                    for entry in step_results:
+                summary_bits = [f"выполнено {done_n} из {len(results)}"]
+                if err_n:
+                    summary_bits.append(f"с ошибкой {err_n}")
+                if cancel_n:
+                    summary_bits.append(f"отменено {cancel_n}")
+                f.write("ИТОГ: " + ", ".join(summary_bits) + "\n")
+                if cancelled:
+                    f.write("Выполнение прервано пользователем.\n")
+
+                if freed_total_gb is not None:
+                    f.write(f"Освобождено: {freed_total_gb} ГБ")
+                    if free_after is not None:
+                        f.write(f"; свободно на C: {free_after} ГБ")
+                    f.write(f"; заняло {elapsed_sec:.0f} сек\n")
+
+                # Причины невыполнения — сразу под итогом, это первое,
+                # что нужно увидеть, если что-то пошло не так.
+                if failures:
+                    f.write("\nНе удалось выполнить:\n")
+                    for title, reason in failures:
+                        f.write(f"  - {title}: {reason}\n")
+
+                # Подробности по пунктам. Раньше здесь печатались все
+                # пункты подряд вместе с построчной детализацией, и
+                # объём очистки повторялся трижды (в детализации пункта,
+                # в разбивке по пунктам и в общей сумме), а скорость
+                # соединения — дважды. Теперь: строка на пункт, а
+                # детализация — только там, где ей есть что сказать.
+                if results:
+                    f.write("\nПо пунктам:\n")
+                    for entry in results:
                         if len(entry) == 3:
                             title, status, details = entry
                         else:
                             title, status = entry
                             details = []
                         label = status_labels.get(status, status)
-                        f.write(f"  [{label}] {title}\n")
+                        freed_b = step_freed.get(title, 0)
+                        suffix = f" — освобождено {format_bytes_gb(freed_b)} ГБ" if freed_b else ""
+                        f.write(f"  [{label}] {title}{suffix}\n")
                         for line in details:
-                            f.write(f"      {line}\n")
-                    f.write("\n")
+                            text = str(line).strip()
+                            # Заголовочные строки вида "Очистка ...:" в
+                            # начале каждого шага дублируют название
+                            # пункта, а строки о бэкапе — служебные.
+                            if not text or text.endswith("...") or text.startswith("Бэкап:"):
+                                continue
+                            f.write(f"      {text}\n")
 
-                # Причины невыполнения пунктов показываются, только если
-                # что-то реально не сработало — если всё прошло без ошибок,
-                # этого раздела в отчёте не будет вовсе.
-                if failures:
-                    f.write("Не удалось выполнить:\n")
-                    for title, reason in failures:
-                        f.write(f"  - {title}: {reason}\n")
-                    f.write("\n")
-
-                # Итог освобождённого — сумма того, что пункты измерили
-                # сами (см. report_freed_bytes). Разница свободного места
-                # идёт ниже и отдельно, с оговоркой: во время работы
-                # система и другие программы тоже пишут на диск, поэтому
-                # она может быть меньше освобождённого и даже
-                # отрицательной, что раньше выглядело как ошибка.
-                measured = {t: b for t, b in step_freed.items() if b}
-                if freed_total_gb is not None:
-                    f.write(f"Освобождено места (подсчитано пунктами): {freed_total_gb} ГБ\n")
-                    for title, num_bytes in measured.items():
-                        f.write(f"  · {title}: {format_bytes_gb(num_bytes)} ГБ\n")
-                    if not measured:
-                        f.write("  · ни один из выполненных пунктов не удаляет файлы сам\n")
-                    f.write(
-                        "  Объём, освобождённый встроенной «Очисткой диска» Windows, сюда не входит —\n"
-                        "  cleanmgr не сообщает его программам.\n"
-                    )
-
-                f.write(f"\nСвободно на диске C до очистки:  {free_before} ГБ\n")
-                f.write(f"Свободно на диске C после очистки: {free_after} ГБ\n")
+                f.write(f"\nСвободно на C: {free_before} ГБ до, {free_after} ГБ после")
                 if delta_gb is not None:
-                    f.write(f"Изменение свободного места: {delta_gb} ГБ\n")
-                    f.write(
-                        "  (справочно: за время работы система и другие программы тоже пишут\n"
-                        "   на диск, поэтому величина может отличаться от строки выше)\n"
-                    )
-                f.write(f"Общее время выполнения: {elapsed_sec:.1f} сек\n")
-
-                if speed_text:
-                    f.write("\n" + speed_text.strip() + "\n")
+                    f.write(f" (изменение {delta_gb} ГБ с учётом записи других программ)")
+                f.write("\n")
         except Exception:
             pass
 
