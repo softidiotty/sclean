@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.13.2"
+APP_VERSION = "1.13.3"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1401,22 +1401,46 @@ def step_usb_power_management(logf):
     # 1. Галочка "Разрешить отключение этого устройства для экономии
     # энергии" — через WMI. Это основной способ; всё остальное ниже
     # лишь подстраховка на уровне драйвера.
+    # Отбор устройств идёт по ДВУМ признакам, а не только по префиксу
+    # "USB\" в имени экземпляра. Хост-контроллеры ("Расширяемый
+    # хост-контроллер AMD USB 3.10") перечислены системой не под USB\,
+    # а под PCI\VEN_..., поэтому фильтр по одному префиксу их пропускал:
+    # отчёт показывал 14 из 14 снятых, а галочка у контроллера
+    # оставалась. Теперь дополнительно берутся все устройства класса USB
+    # (это ровно раздел "Контроллеры USB" в диспетчере устройств),
+    # независимо от того, какой шиной они перечислены.
     wmi_ps = (
-        "$total = 0; $changed = 0; $verified = 0; $failed = 0; "
+        "$want = @{}; "
+        "foreach ($d in (Get-PnpDevice -Class 'USB' -ErrorAction SilentlyContinue)) { "
+        "  if ($d.InstanceId) { $want[$d.InstanceId.ToUpper()] = $true } "
+        "}; "
+        "function Test-Match($name) { "
+        "  if (-not $name) { return $false }; "
+        "  $n = $name.ToUpper(); "
+        "  if ($n.EndsWith('_0')) { $n = $n.Substring(0, $n.Length - 2) }; "
+        "  if ($n.StartsWith('USB\\')) { return $true }; "
+        "  return $want.ContainsKey($n) "
+        "}; "
+        "$total = 0; $changed = 0; $failed = 0; "
         "try { $items = @(Get-CimInstance -Namespace root/WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop) } "
         "catch { $items = @() }; "
         "foreach ($it in $items) { "
-        "  if ($it.InstanceName -notlike 'USB*') { continue }; "
+        "  if (-not (Test-Match $it.InstanceName)) { continue }; "
         "  $total++; "
-        "  if ($it.Enable -eq $false) { $verified++; continue }; "
+        "  if ($it.Enable -eq $false) { continue }; "
         "  try { "
         "    $it.Enable = $false; "
         "    Set-CimInstance -InputObject $it -ErrorAction Stop; "
         "    $changed++; "
         "  } catch { $failed++; continue } "
         "}; "
-        "try { $after = @(Get-CimInstance -Namespace root/WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop | "
-        "     Where-Object { $_.InstanceName -like 'USB*' -and $_.Enable -eq $false }).Count } catch { $after = -1 }; "
+        "$after = -1; "
+        "try { "
+        "  $after = 0; "
+        "  foreach ($it in @(Get-CimInstance -Namespace root/WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop)) { "
+        "    if ((Test-Match $it.InstanceName) -and ($it.Enable -eq $false)) { $after++ } "
+        "  } "
+        "} catch { $after = -1 }; "
         "Write-Output ($total.ToString() + '|' + $changed.ToString() + '|' + $failed.ToString() + '|' + $after.ToString())"
     )
     out = run_ps(wmi_ps, timeout=120)
