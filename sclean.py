@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.13.2"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1372,28 +1372,73 @@ def step_usb_power_management(logf):
     экономии энергии" (свойства устройства -> вкладка "Управление
     электропитанием") для всех USB-концентраторов.
 
-    Важно про выбор ключей реестра. В первой версии этого пункта
-    выставлялся только EnhancedPowerManagementEnabled — и пункт
-    рапортовал об успехе, хотя галочка в диспетчере устройств
-    оставалась включённой. Причина: EnhancedPowerManagementEnabled
-    относится к управлению питанием линка USB 3.0, а состояние самой
-    галочки хранится в SelectiveSuspendEnabled. Теперь выставляются оба
-    значения, и результат проверяется обратным чтением, чтобы отчёт не
-    врал об успехе.
+    История вопроса — почему тут именно WMI, а не реестр. Первые две
+    версии этого пункта писали значения в
+    HKLM\\SYSTEM\\CurrentControlSet\\Enum\\<устройство>\\Device Parameters
+    (сначала EnhancedPowerManagementEnabled, потом ещё и
+    SelectiveSuspendEnabled). Запись проходила успешно и подтверждалась
+    обратным чтением — но галочка в диспетчере устройств оставалась
+    отмеченной даже после перезагрузки. Значит, галочка читает НЕ эти
+    значения: они влияют на поведение драйвера, а не на состояние,
+    которое показывает и меняет вкладка "Управление электропитанием".
 
-    Дополнительно выставляется машинный переключатель
-    HKLM\\SYSTEM\\CurrentControlSet\\Services\\USB\\DisableSelectiveSuspend=1 —
-    он запрещает выборочную приостановку USB глобально, поверх настроек
-    отдельных устройств, и потому надёжнее всего для POS-периферии
-    (сканеры штрихкодов, чековые принтеры), которая иначе отваливается.
+    За саму галочку отвечает WMI-класс MSPower_DeviceEnable в
+    пространстве имён root\\WMI: у каждого устройства, у которого эта
+    вкладка есть, там ровно один экземпляр с булевым свойством Enable.
+    Именно его переключает диспетчер устройств, поэтому запись туда —
+    единственный способ снять галочку программно. Применяется сразу,
+    без перезагрузки.
 
-    Все три настройки применяются к драйверу при следующей загрузке —
-    до перезагрузки галочка в диспетчере устройств может оставаться
-    отмеченной, о чём пункт честно пишет в отчёт.
+    Реестровые значения и машинный переключатель
+    Services\\USB\\DisableSelectiveSuspend=1 оставлены дополнительно:
+    они не двигают галочку, но запрещают выборочную приостановку USB на
+    уровне драйвера и системы. Для POS-периферии (сканеры штрихкодов,
+    чековые принтеры), которая отваливается при засыпании порта, важен
+    именно суммарный эффект.
     """
     logf("Отключение энергосбережения USB-портов...")
 
-    # 1. Глобальный запрет выборочной приостановки USB.
+    # 1. Галочка "Разрешить отключение этого устройства для экономии
+    # энергии" — через WMI. Это основной способ; всё остальное ниже
+    # лишь подстраховка на уровне драйвера.
+    wmi_ps = (
+        "$total = 0; $changed = 0; $verified = 0; $failed = 0; "
+        "try { $items = @(Get-CimInstance -Namespace root/WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop) } "
+        "catch { $items = @() }; "
+        "foreach ($it in $items) { "
+        "  if ($it.InstanceName -notlike 'USB*') { continue }; "
+        "  $total++; "
+        "  if ($it.Enable -eq $false) { $verified++; continue }; "
+        "  try { "
+        "    $it.Enable = $false; "
+        "    Set-CimInstance -InputObject $it -ErrorAction Stop; "
+        "    $changed++; "
+        "  } catch { $failed++; continue } "
+        "}; "
+        "try { $after = @(Get-CimInstance -Namespace root/WMI -ClassName MSPower_DeviceEnable -ErrorAction Stop | "
+        "     Where-Object { $_.InstanceName -like 'USB*' -and $_.Enable -eq $false }).Count } catch { $after = -1 }; "
+        "Write-Output ($total.ToString() + '|' + $changed.ToString() + '|' + $failed.ToString() + '|' + $after.ToString())"
+    )
+    out = run_ps(wmi_ps, timeout=120)
+    parts = (out or "").strip().split("|")
+    wmi_ok = False
+    if len(parts) == 4 and all(p.lstrip("-").isdigit() for p in parts):
+        total, changed, failed, after = (int(p) for p in parts)
+        if total == 0:
+            logf("  WMI не сообщил ни об одном USB-устройстве с вкладкой управления электропитанием.")
+        else:
+            wmi_ok = True
+            logf(f"  Галочка энергосбережения: устройств с этой настройкой {total}, снято сейчас {changed}, "
+                 f"уже было снято {total - changed - failed}.")
+            if after >= 0:
+                logf(f"  Проверка после записи: галочка снята у {after} из {total}.")
+            if failed:
+                logf(f"  Не удалось изменить {failed} устройств (драйвер запретил изменение).")
+    else:
+        logf(f"  Не удалось обратиться к WMI MSPower_DeviceEnable (ответ: {(out or '').strip()[:120] or 'нет'}).")
+
+    # 2. Глобальный запрет выборочной приостановки USB (на уровне
+    # системы, поверх настроек отдельных устройств).
     global_ps = (
         "$k = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\USB'; "
         "try { "
@@ -1409,10 +1454,9 @@ def step_usb_power_management(logf):
     else:
         logf(f"  Не удалось включить глобальный запрет выборочной приостановки USB (ответ: {gout or 'нет'}).")
 
-    # 2. Пер-устройственные значения + обратная проверка. Проверяем
-    # именно SelectiveSuspendEnabled — это то, что отражает галочка.
+    # 3. Значения уровня драйвера по каждому устройству.
     ps = (
-        "$total = 0; $set = 0; $verified = 0; "
+        "$total = 0; $set = 0; "
         "$devs = Get-PnpDevice -Class 'USB' -ErrorAction SilentlyContinue; "
         "foreach ($d in $devs) { "
         "  if (-not $d.InstanceId) { continue }; "
@@ -1421,33 +1465,23 @@ def step_usb_power_management(logf):
         "  if (-not (Test-Path $key)) { continue }; "
         "  try { "
         "    Set-ItemProperty -Path $key -Name 'SelectiveSuspendEnabled' -Value 0 -Type DWord -ErrorAction Stop; "
+        "    Set-ItemProperty -Path $key -Name 'EnhancedPowerManagementEnabled' -Value 0 -Type DWord -ErrorAction SilentlyContinue; "
         "    $set++; "
         "  } catch {} "
-        "  try { "
-        "    Set-ItemProperty -Path $key -Name 'EnhancedPowerManagementEnabled' -Value 0 -Type DWord -ErrorAction SilentlyContinue; "
-        "  } catch {} "
-        "  try { "
-        "    $v = (Get-ItemProperty -Path $key -Name 'SelectiveSuspendEnabled' -ErrorAction Stop).SelectiveSuspendEnabled; "
-        "    if ($v -eq 0) { $verified++ } "
-        "  } catch {} "
         "}; "
-        "Write-Output ($total.ToString() + '|' + $set.ToString() + '|' + $verified.ToString())"
+        "Write-Output ($total.ToString() + '|' + $set.ToString())"
     )
-    out = run_ps(ps, timeout=120)
-    parts = (out or "").strip().split("|")
-    if len(parts) == 3 and all(p.isdigit() for p in parts):
-        total, was_set, verified = (int(p) for p in parts)
-        if total == 0:
-            logf("  USB-устройства не найдены — пропущено.")
-            return
-        logf(f"  Найдено USB-устройств: {total}, настройка записана для {was_set}, подтверждена чтением: {verified}.")
-        if verified < was_set:
-            logf("  Часть значений не подтвердилась при обратном чтении — возможно, драйвер перезаписал их.")
+    out2 = run_ps(ps, timeout=120)
+    parts2 = (out2 or "").strip().split("|")
+    if len(parts2) == 2 and all(p.isdigit() for p in parts2):
+        total2, set2 = (int(p) for p in parts2)
+        logf(f"  Настройки уровня драйвера записаны для {set2} из {total2} USB-устройств.")
     else:
-        logf(f"  Не удалось применить настройку по устройствам (ответ: {(out or '').strip()[:120] or 'нет'}).")
+        logf("  Настройки уровня драйвера записать не удалось.")
 
-    logf("  Настройки вступят в силу после перезагрузки; до неё галочка в диспетчере")
-    logf("  устройств может отображаться отмеченной, хотя запрет уже записан.")
+    if not wmi_ok:
+        logf("  Внимание: основной способ (WMI) не сработал — галочка в диспетчере")
+        logf("  устройств могла остаться отмеченной, хотя запрет на уровне системы записан.")
 
 
 def _find_speedtest_cli():
