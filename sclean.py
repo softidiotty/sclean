@@ -17,7 +17,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.5"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1152,11 +1152,17 @@ STEPS = [
      "Измеряет скорость скачивания через Speedtest CLI (если найден) или резервным\n"
      "способом — скачиванием тестового файла.",
      True, False, 30),
+    ("system_info",    "Сбор информации о системе (CPU/RAM/диски/GPU/ОС)", step_system_info, True,
+     "Собирает сведения о процессоре, памяти, дисках, видеокарте, материнской плате\n"
+     "и версии Windows. Результат сохраняется в отдельный файл рядом с отчётом об\n"
+     "очистке, а не смешивается с ним.",
+     False, False, 5),
 ]
 
-# Информация о системе (CPU/RAM/диски/GPU/ОС) больше не отдельный пункт
-# выбора — она собирается автоматически при каждом запуске и всегда
-# попадает в отчёт, независимо от того, какие пункты отмечены.
+# Информация о системе — обычный пункт списка (id "system_info"), но
+# результат его выполнения не идёт в общий текстовый отчёт об очистке —
+# _worker() отдельно перехватывает этот id и пишет результат в собственный
+# файл (см. _write_system_info_report).
 
 # id пунктов, отмечаемых пресетом "рекомендуемые настройки" (безопасный
 # набор: без sfc/dism — долгий — и без отключения брандмауэра — рискованно).
@@ -1363,8 +1369,19 @@ def apply_update_and_restart(new_exe_path):
     # обновление всё равно проходит, но с лишним диалогом. Прямой вызов
     # exe без "start" — на одно звено короче, UAC поднимает процесс от
     # самого bat/cmd напрямую и ошибка не возникает.
+    # chcp 65001 переключает кодовую страницу консоли cmd.exe на UTF-8 на
+    # время выполнения .bat. Это нужно, потому что пути к exe почти всегда
+    # содержат кириллицу (имя пользователя, "Рабочий стол", ручные копии
+    # файла вида "sclean (2) — копия.exe" и т.п.), а если записать .bat в
+    # кодировке mbcs (= активная ANSI-кодовая страница Windows на момент
+    # записи) и она разойдётся с кодовой страницей, в которой .bat реально
+    # выполняется, "copy" получает искажённые кириллические имена и вместо
+    # перезаписи оригинального exe создаёт новый файл с "мусорным" именем.
+    # UTF-8 + chcp 65001 — единственная комбинация, не зависящая от текущей
+    # системной локали.
     bat_content = (
         "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
         "timeout /t 2 /nobreak >nul\r\n"
         f':retry\r\n'
         f'copy /Y "{new_exe_path}" "{current_exe}" >nul 2>&1\r\n'
@@ -1377,11 +1394,11 @@ def apply_update_and_restart(new_exe_path):
         f'del "%~f0" >nul 2>&1\r\n'
     )
     try:
-        with open(bat_path, "w", encoding="mbcs") as f:
+        with open(bat_path, "w", encoding="utf-8-sig") as f:
             f.write(bat_content)
     except Exception:
         try:
-            with open(bat_path, "w", encoding="utf-8") as f:
+            with open(bat_path, "w", encoding="mbcs") as f:
                 f.write(bat_content)
         except Exception:
             return False
@@ -1591,7 +1608,6 @@ class CleanerApp:
         self.worker_thread = None
         self.check_vars = {}
         self.step_rows = {}
-        self.system_info_text = ""
         self.log_lines = []
         self.current_steps = []
         self.current_statuses = {}
@@ -1933,6 +1949,7 @@ class CleanerApp:
                   style="Dim.TLabel").pack(side="right")
 
         self.report_path = None
+        self.system_info_report_path = None
 
     def select_all(self):
         for step_id, var in self.check_vars.items():
@@ -2167,6 +2184,42 @@ class CleanerApp:
 
         self._start_run([("restore", "Восстановление настроек из бэкапа", restore_step, False)])
 
+    def _build_restore_checkbox_row(self, parent, text, var, available):
+        """
+        Строит строку с квадратным чекбоксом в едином стиле с основным
+        списком пунктов очистки (белый квадрат с рамкой, чёрный внутренний
+        квадрат при выборе) — вместо стандартного ttk.Checkbutton с
+        крестиком, который используется системной темой Windows.
+        """
+        row = tk.Frame(parent, bg=DARK_BG)
+        row.pack(fill="x", padx=14, pady=2)
+
+        box_canvas = tk.Canvas(row, width=20, height=20, bg=DARK_BG, highlightthickness=0, bd=0)
+        box_canvas.pack(side="left", padx=(0, 8))
+
+        fg = DARK_FG if available else DARK_FG_DIM
+        label = tk.Label(row, text=text, bg=DARK_BG, fg=fg, font=(APP_FONT, 9), anchor="w")
+        label.pack(side="left", fill="x", expand=True)
+
+        def draw():
+            box_canvas.delete("all")
+            outline = DARK_BORDER if available else DARK_FG_DIM
+            box_canvas.create_rectangle(2, 2, 18, 18, outline=outline, width=2, fill="#ffffff")
+            if var.get():
+                box_canvas.create_rectangle(5, 5, 15, 15, outline="", fill="#000000")
+
+        def toggle(_event=None):
+            if not available:
+                return
+            var.set(not var.get())
+            draw()
+
+        if available:
+            box_canvas.bind("<Button-1>", toggle)
+            label.bind("<Button-1>", toggle)
+
+        draw()
+
     def _ask_restore_categories(self, backup):
         """
         Диалог точечного восстановления: пользователь может выбрать, какие
@@ -2202,8 +2255,7 @@ class CleanerApp:
             var = tk.BooleanVar(value=available)
             vars_map[cat] = var
             text = labels[cat] + ("" if available else " (нет данных в бэкапе)")
-            chk = ttk.Checkbutton(dlg, text=text, variable=var, state=("normal" if available else "disabled"))
-            chk.pack(anchor="w", padx=14, pady=2)
+            self._build_restore_checkbox_row(dlg, text, var, available)
 
         result = {"categories": None}
 
@@ -2305,10 +2357,13 @@ class CleanerApp:
         # ждёт его. Перед финальным отчётом мы дожидаемся завершения этого
         # потока, чтобы "Освобождено места" учитывало и его результат.
         cleanmgr_entry = None
+        system_info_entry = None
         other_steps = []
         for step in steps_to_run:
             if step[0] == "cleanmgr":
                 cleanmgr_entry = step
+            elif step[0] == "system_info":
+                system_info_entry = step
             else:
                 other_steps.append(step)
 
@@ -2384,17 +2439,23 @@ class CleanerApp:
                 ))
                 cleanmgr_thread.join(timeout=2)
 
-        # Информация о системе собирается всегда, отдельно от выбранных
-        # пунктов — это не пункт выбора, а неизменная часть каждого отчёта.
-        # Если пользователь отменил выполнение — не собираем её, отчёт и
-        # так будет отражать факт отмены.
-        system_info_text = ""
-        if not cancelled:
-            self.msg_queue.put(("status", "Сбор информации о системе..."))
+        # "Сбор информации о системе" — обычный пункт списка, выполняется
+        # только если отмечен пользователем. Результат не идёт в общий
+        # отчёт об очистке, а пишется в собственный отдельный файл.
+        system_info_path = None
+        if system_info_entry is not None and not cancelled:
+            si_id, si_title, si_func, si_returns_text = system_info_entry[:4]
+            self.msg_queue.put(("step_status", (si_id, "running")))
+            self.msg_queue.put(("status", f"Выполняется: {si_title}"))
             try:
-                system_info_text = step_system_info(logf)
+                system_info_text = si_func(logf)
+                if si_returns_text and system_info_text:
+                    system_info_path = self._write_system_info_report(system_info_text)
+                self.msg_queue.put(("step_status", (si_id, "done")))
             except Exception as e:
-                failures.append(("Сбор информации о системе", str(e)))
+                with failures_lock:
+                    failures.append((si_title, str(e)))
+                self.msg_queue.put(("step_status", (si_id, "error")))
 
         collected_system_info = "\n".join(collected_texts)
 
@@ -2402,13 +2463,30 @@ class CleanerApp:
         elapsed = time.time() - start_time
 
         report_path = self._write_report(
-            collected_system_info, system_info_text, free_before, free_after, elapsed, failures, cancelled
+            collected_system_info, free_before, free_after, elapsed, failures, cancelled
         )
         rotate_old_reports()
 
-        self.msg_queue.put(("done", (report_path, cancelled)))
+        self.msg_queue.put(("done", (report_path, system_info_path, cancelled)))
 
-    def _write_report(self, speed_text, system_info_text, free_before, free_after, elapsed_sec, failures, cancelled):
+    def _write_system_info_report(self, system_info_text):
+        """
+        Пишет результат пункта "Сбор информации о системе" в отдельный
+        файл рядом с обычным отчётом об очистке — sclean_system_*.txt
+        вместо смешивания с sclean_*.txt, чтобы отчёт об очистке оставался
+        компактным, а системную информацию можно было прислать отдельно.
+        """
+        date_str = datetime.date.today().isoformat()
+        time_str = datetime.datetime.now().strftime("%H%M%S")
+        path = os.path.join(get_app_data_dir(), f"sclean_system_{date_str}_{time_str}.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(system_info_text.strip() + "\n")
+        except Exception:
+            return None
+        return path
+
+    def _write_report(self, speed_text, free_before, free_after, elapsed_sec, failures, cancelled):
         date_str = datetime.date.today().isoformat()
         time_str = datetime.datetime.now().strftime("%H%M%S")
         report_path = os.path.join(get_app_data_dir(), f"sclean_{date_str}_{time_str}.txt")
@@ -2443,9 +2521,6 @@ class CleanerApp:
 
                 if speed_text:
                     f.write("\n" + speed_text.strip() + "\n")
-
-                if system_info_text:
-                    f.write("\n" + system_info_text + "\n")
         except Exception:
             pass
 
@@ -2507,8 +2582,9 @@ class CleanerApp:
                 elif kind == "progress":
                     self.progress.configure(value=payload)
                 elif kind == "done":
-                    report_path, cancelled = payload
+                    report_path, system_info_path, cancelled = payload
                     self.report_path = report_path
+                    self.system_info_report_path = system_info_path
                     self.status_label.configure(text="Отменено." if cancelled else "Готово. 100%")
                     if not cancelled:
                         self.progress.configure(value=100)
@@ -2536,6 +2612,8 @@ class CleanerApp:
                         )
                     else:
                         summary = f"Готово: все пункты выполнены успешно ({done_count} из {total_count})."
+                    if system_info_path:
+                        summary += f"\nИнформация о системе сохранена отдельно: {os.path.basename(system_info_path)}"
                     self._render_steps_panel(self.current_steps, self.current_statuses, summary=summary)
         except queue.Empty:
             pass
