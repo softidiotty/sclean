@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.20.0"
+APP_VERSION = "1.21.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -2585,6 +2585,74 @@ DARK_ETA_WARN = "#e05260"
 # сколько занято, но и сколько осталось.
 DARK_DISK_FREE = "#3f8f5f"
 
+# Псевдообъём. Настоящих теней и скруглений в tkinter нет (у виджетов
+# нет альфа-канала и border-radius), поэтому объём имитируется двумя
+# однопиксельными полосами: тёмная под блоком читается как тень, а
+# светлая сверху — как блик на верхней грани.
+DARK_SHADOW = "#141415"
+DARK_HIGHLIGHT = "#5a5a5e"
+
+# Акцентные полоски слева у блоков — по цвету на каждый, чтобы блоки
+# различались мгновенно, ещё до чтения заголовка.
+BLOCK_ACCENTS = {
+    "header": "#7a7a80",
+    "disk": "#c0392b",
+    "system": "#3f7fa8",
+    "diag": "#8f6fb0",
+    "steps": "#7a1620",
+    "actions": "#6a6a70",
+    "run": "#3f8f5f",
+}
+
+
+def _mix_colors(color_a, color_b, ratio):
+    """
+    Смешивает два цвета #rrggbb в пропорции ratio (0.0 -> color_a,
+    1.0 -> color_b). Нужна для градиентной заливки полос: Canvas умеет
+    только сплошные прямоугольники, поэтому градиент рисуется набором
+    узких полосок с плавно меняющимся цветом.
+    """
+    ratio = max(0.0, min(1.0, ratio))
+    a = (int(color_a[1:3], 16), int(color_a[3:5], 16), int(color_a[5:7], 16))
+    b = (int(color_b[1:3], 16), int(color_b[3:5], 16), int(color_b[5:7], 16))
+    mixed = tuple(int(round(x + (y - x) * ratio)) for x, y in zip(a, b))
+    return "#%02x%02x%02x" % mixed
+
+
+def _lighten(color, amount):
+    """Осветляет цвет на amount (0..1) — подмешивает белый."""
+    return _mix_colors(color, "#ffffff", amount)
+
+
+def _darken(color, amount):
+    """Затемняет цвет на amount (0..1) — подмешивает чёрный."""
+    return _mix_colors(color, "#000000", amount)
+
+
+def draw_gradient_bar(canvas, x0, y0, x1, y1, base_color, tag=None):
+    """
+    Рисует на Canvas горизонтальную полосу с вертикальным градиентом:
+    сверху светлее базового цвета, снизу темнее, плюс тонкий блик по
+    верхней грани. Это то, чем в вебе занимался бы linear-gradient —
+    здесь приходится класть полоски вручную.
+    """
+    height = int(y1 - y0)
+    if height <= 0 or x1 <= x0:
+        return
+    top = _lighten(base_color, 0.18)
+    bottom = _darken(base_color, 0.22)
+    for i in range(height):
+        shade = _mix_colors(top, bottom, i / max(1, height - 1))
+        canvas.create_rectangle(
+            x0, y0 + i, x1, y0 + i + 1, outline="", fill=shade,
+            **({"tags": tag} if tag else {}),
+        )
+    # Блик по верхней грани — одна светлая линия.
+    canvas.create_rectangle(
+        x0, y0, x1, y0 + 1, outline="", fill=_lighten(base_color, 0.45),
+        **({"tags": tag} if tag else {}),
+    )
+
 
 class Tooltip:
     """
@@ -2945,10 +3013,7 @@ class CleanerApp:
         # "рекомендуемые настройки". Обёрнут рамкой для визуального отделения
         # от остальных блоков интерфейса.
         # ------------------------------------------------------------------
-        block1_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        block1_outer.pack(fill="x", padx=10, pady=(10, 8))
-        block1 = tk.Frame(block1_outer, bg=DARK_BG)
-        block1.pack(fill="x", padx=2, pady=2)
+        block1 = self._make_block(scroll_frame, BLOCK_ACCENTS["header"], pady=(10, 8))
 
         # Сохраняем в self: панель "О программе" разворачивается сразу
         # после этой строки (after=self.header_frame).
@@ -3100,10 +3165,7 @@ class CleanerApp:
         # и "Диагностика" лежали внутри одной общей рамки и читались как
         # один блок с внутренними карточками.
         # ------------------------------------------------------------------
-        disk_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        disk_outer.pack(fill="x", padx=10, pady=(0, 8))
-        self.disk_usage_row = tk.Frame(disk_outer, bg=DARK_BG)
-        self.disk_usage_row.pack(fill="x", padx=2, pady=2)
+        self.disk_usage_row = self._make_block(scroll_frame, BLOCK_ACCENTS["disk"])
         disk_usage_inner = tk.Frame(self.disk_usage_row, bg=DARK_BG)
         disk_usage_inner.pack(fill="x", padx=10, pady=8)
 
@@ -3144,16 +3206,12 @@ class CleanerApp:
         )
 
         def _disk_hover_on(_e=None):
-            # Подсвечиваем внешнюю рамку блока: сама строка теперь без
-            # собственной границы, она у блока верхнего уровня.
-            disk_outer.configure(bg=DARK_ETA_WARN)
             self.disk_usage_row.configure(bg=DARK_BG_ALT)
             for w in _disk_bg_widgets:
                 w.configure(bg=DARK_BG_ALT)
             self.disk_usage_hint.configure(fg=DARK_ETA_WARN)
 
         def _disk_hover_off(_e=None):
-            disk_outer.configure(bg=DARK_BLOCK_BORDER)
             self.disk_usage_row.configure(bg=DARK_BG)
             for w in _disk_bg_widgets:
                 w.configure(bg=DARK_BG)
@@ -3193,10 +3251,7 @@ class CleanerApp:
         # ------------------------------------------------------------------
         # Блок "Система" — отдельный сворачиваемый блок верхнего уровня.
         # ------------------------------------------------------------------
-        sysinfo_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        sysinfo_outer.pack(fill="x", padx=10, pady=(0, 8))
-        sysinfo_card = tk.Frame(sysinfo_outer, bg=DARK_BG)
-        sysinfo_card.pack(fill="x", padx=2, pady=2)
+        sysinfo_card = self._make_block(scroll_frame, BLOCK_ACCENTS["system"])
 
         sysinfo_head = tk.Frame(sysinfo_card, bg=DARK_BG)
         sysinfo_head.pack(fill="x", padx=10, pady=8)
@@ -3307,10 +3362,7 @@ class CleanerApp:
         # ------------------------------------------------------------------
         # Блок "Диагностика железа" — отдельный блок верхнего уровня.
         # ------------------------------------------------------------------
-        diag_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        diag_outer.pack(fill="x", padx=10, pady=(0, 8))
-        self.diag_card = tk.Frame(diag_outer, bg=DARK_BG)
-        self.diag_card.pack(fill="x", padx=2, pady=2)
+        self.diag_card = self._make_block(scroll_frame, BLOCK_ACCENTS["diag"])
         # Шапка устроена так же, как у блока "Система": стрелка,
         # название, вся строка кликабельна. Отдельной кнопки
         # "Подробнее" больше нет, а из заголовка убран текст результата
@@ -3424,11 +3476,7 @@ class CleanerApp:
         # сведениями о системе, из-за чего заголовок относился визуально
         # к диагностике, а не к списку, который он подписывает.
         # ------------------------------------------------------------------
-        steps_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        steps_outer.pack(fill="x", padx=10, pady=(0, 8))
-
-        steps_block = tk.Frame(steps_outer, bg=DARK_BG)
-        steps_block.pack(fill="x", padx=2, pady=2)
+        steps_block = self._make_block(scroll_frame, BLOCK_ACCENTS["steps"])
 
         top_frame = tk.Frame(steps_block, bg=DARK_BG)
         top_frame.pack(fill="x", padx=8, pady=(8, 0))
@@ -3516,10 +3564,7 @@ class CleanerApp:
         # Блок 3: основные действия — запуск всего отмеченного, отмена,
         # сворачивание в трей, открытие отчёта, бэкап.
         # ------------------------------------------------------------------
-        block3_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        block3_outer.pack(fill="x", padx=10, pady=(0, 8))
-        block3 = tk.Frame(block3_outer, bg=DARK_BG)
-        block3.pack(fill="x", padx=2, pady=2)
+        block3 = self._make_block(scroll_frame, BLOCK_ACCENTS["actions"])
 
         btns_frame = ttk.Frame(block3)
         btns_frame.pack(fill="x", padx=8, pady=6)
@@ -3546,10 +3591,7 @@ class CleanerApp:
         # Блок 4: процесс выполнения — статус, индикатор прогресса и журнал
         # выполняемых пунктов. Визуально отделён от блока с кнопками.
         # ------------------------------------------------------------------
-        block4_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        block4_outer.pack(fill="x", padx=10, pady=(0, 8))
-        block4 = tk.Frame(block4_outer, bg=DARK_BG)
-        block4.pack(fill="x", padx=2, pady=2)
+        block4 = self._make_block(scroll_frame, BLOCK_ACCENTS["run"])
 
         # Заголовок блока — как у списка пунктов выше: без него панель
         # выполнения выглядела безымянным набором элементов.
@@ -3724,7 +3766,7 @@ class CleanerApp:
         pct = self._progress_value
         fill_w = int(w * pct / 100)
         if fill_w > 0:
-            canvas.create_rectangle(0, 0, fill_w, h, outline="", fill=DARK_ACCENT)
+            draw_gradient_bar(canvas, 0, 0, fill_w, h, DARK_ACCENT)
 
         # Процент пишем по центру; цвет зависит от того, накрыт ли центр
         # заполненной частью — иначе текст сливался бы с фоном.
@@ -3778,10 +3820,13 @@ class CleanerApp:
         self.disk_usage_canvas.configure(width=w, height=h)
         used_w = max(2, int(w * percent / 100))
 
-        self.disk_usage_canvas.create_rectangle(
-            0, 0, w, h, outline="", fill=DARK_DISK_FREE)
-        self.disk_usage_canvas.create_rectangle(
-            0, 0, used_w, h, outline="", fill=DARK_ETA_WARN if warn else DARK_ACCENT)
+        # Обе части — с вертикальным градиентом и бликом сверху: плоская
+        # заливка выглядела наклейкой, градиент даёт объём.
+        draw_gradient_bar(self.disk_usage_canvas, 0, 0, w, h, DARK_DISK_FREE)
+        draw_gradient_bar(
+            self.disk_usage_canvas, 0, 0, used_w, h,
+            DARK_ETA_WARN if warn else DARK_ACCENT,
+        )
         self.disk_usage_canvas.create_rectangle(
             0, 0, w, h, outline=DARK_BORDER, width=1)
 
@@ -3814,9 +3859,10 @@ class CleanerApp:
         уже открывшегося окна проводника, которое может появиться не
         мгновенно или свернуться за окно программы.
         """
-        outer = self.disk_usage_row.master
-        outer.configure(bg=DARK_ETA_WARN)
-        self.root.after(200, lambda: outer.configure(bg=DARK_BLOCK_BORDER))
+        # Вспышка фона самой строки: у блока теперь не рамка, а
+        # акцентная полоска слева, менять её цвет было бы неуместно.
+        self.disk_usage_row.configure(bg=DARK_BG_ALT)
+        self.root.after(200, lambda: self.disk_usage_row.configure(bg=DARK_BG))
 
     def _open_startup_folders(self):
         """
@@ -3983,6 +4029,42 @@ class CleanerApp:
             self.diag_details_frame.pack_forget()
             self.diag_sep.pack_forget()
         self._draw_diag_toggle()
+
+    def _make_block(self, parent, accent, pady=(0, 8)):
+        """
+        Собирает "приподнятую" карточку блока и возвращает контейнер для
+        содержимого.
+
+        Настоящих теней и скруглений в tkinter нет, поэтому объём
+        имитируется слоями:
+          - тонкая тёмная полоса снизу читается как тень;
+          - светлая линия по верхней грани — как блик;
+          - вертикальная полоска слева своим цветом на каждый блок,
+            чтобы блоки различались до чтения заголовка.
+
+        Порядок упаковки важен: сначала блик (сверху), затем тело,
+        затем тень (снизу) — иначе слои встанут не в том порядке.
+        """
+        wrapper = tk.Frame(parent, bg=parent["bg"])
+        wrapper.pack(fill="x", padx=10, pady=pady)
+
+        # Блик по верхней грани.
+        tk.Frame(wrapper, bg=DARK_HIGHLIGHT, height=1).pack(fill="x")
+
+        body_row = tk.Frame(wrapper, bg=DARK_BLOCK_BORDER)
+        body_row.pack(fill="x")
+
+        # Цветная полоска-акцент слева, во всю высоту блока.
+        tk.Frame(body_row, bg=accent, width=4).pack(side="left", fill="y")
+
+        inner = tk.Frame(body_row, bg=DARK_BG)
+        inner.pack(side="left", fill="both", expand=True, padx=(0, 2), pady=2)
+
+        # Тень под блоком: две полосы разной яркости дают мягкий спад.
+        tk.Frame(wrapper, bg=DARK_SHADOW, height=2).pack(fill="x")
+        tk.Frame(wrapper, bg=_mix_colors(DARK_SHADOW, DARK_BG, 0.5), height=1).pack(fill="x")
+
+        return inner
 
     def _bind_header_hover(self, row, children, on_click):
         """
