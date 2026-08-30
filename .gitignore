@@ -16,3 +16,10 @@ sclean_backup.json
 .idea/
 Thumbs.db
 desktop.ini
+
+# Предшественник sclean — оставлен на диске, но в репозиторий не нужен
+system_cleaner_silent.py
+system_cleaner_silent.spec
+
+# Неиспользуемое превью иконки
+sclean_preview_32_upscaled.png
