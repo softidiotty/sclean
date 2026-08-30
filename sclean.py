@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.19.1"
+APP_VERSION = "1.20.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -3130,7 +3130,9 @@ class CleanerApp:
             disk_bar_row, text="", bg=DARK_BG, fg=DARK_FG, font=(APP_FONT, 9, "bold"),
         )
         self.disk_free_label.pack(side="left", padx=(10, 0))
-        self._refresh_disk_usage_label()
+        # Первая отрисовка + запуск автообновления раз в 5 секунд.
+        self._disk_refresh_after_id = None
+        self._start_disk_autorefresh()
 
         # Клик по индикатору открывает диск C: в проводнике. Hover
         # подсвечивает рамку и фон акцентным цветом, а сам клик даёт
@@ -3199,19 +3201,20 @@ class CleanerApp:
         sysinfo_head = tk.Frame(sysinfo_card, bg=DARK_BG)
         sysinfo_head.pack(fill="x", padx=10, pady=8)
 
-        self._sysinfo_expanded = True
+        # Свёрнут по умолчанию — как и остальные блоки, чтобы при
+        # запуске сразу был виден список пунктов, а не три раскрытых
+        # справочных панели.
+        self._sysinfo_expanded = False
         self.sysinfo_toggle_btn = tk.Label(
-            sysinfo_head, text="▾", bg=DARK_BG, fg=DARK_FG,
+            sysinfo_head, text="▸", bg=DARK_BG, fg=DARK_FG,
             font=(APP_FONT, 10, "bold"), cursor="hand2", padx=4,
         )
         self.sysinfo_toggle_btn.pack(side="left")
-        sysinfo_title = tk.Label(
+        self.sysinfo_title = tk.Label(
             sysinfo_head, text="🖥  Система", bg=DARK_BG, fg=DARK_FG,
             font=(APP_FONT, 11, "bold"), cursor="hand2",
         )
-        sysinfo_title.pack(side="left", padx=(6, 0))
-        for w in (self.sysinfo_toggle_btn, sysinfo_title, sysinfo_head):
-            w.bind("<Button-1>", lambda e: self._toggle_sysinfo())
+        self.sysinfo_title.pack(side="left", padx=(6, 0))
 
         # Подсказки при наведении на кнопках "Копировать" нет: надпись
         # и так говорит, что делает кнопка, а всплывающее окно только
@@ -3221,11 +3224,19 @@ class CleanerApp:
         )
         self.copy_summary_btn.pack(side="right")
 
-        tk.Frame(sysinfo_card, bg=DARK_BLOCK_BORDER, height=2).pack(fill="x")
+        # Подсветка всей шапки при наведении — тем же приёмом, что у
+        # "О программе" и "Автозагрузки" в верхней строке: сразу видно,
+        # что по заголовку можно кликнуть.
+        self._bind_header_hover(
+            sysinfo_head,
+            (self.sysinfo_toggle_btn, self.sysinfo_title),
+            self._toggle_sysinfo,
+        )
+
+        self.sysinfo_sep = tk.Frame(sysinfo_card, bg=DARK_BLOCK_BORDER, height=2)
 
         self.sysinfo_body = tk.Frame(sysinfo_card, bg=DARK_BG)
-        self.sysinfo_body.pack(fill="x")
-        sysinfo_inner = tk.Frame(self.sysinfo_body, bg=DARK_BG)
+        sysinfo_inner = tk.Frame(self.sysinfo_body, bg=DARK_ENTRY_BG)
         sysinfo_inner.pack(fill="x", padx=10, pady=8)
 
         # Весь блок — ОДИН Text, а не отдельные Entry по строкам:
@@ -3234,10 +3245,12 @@ class CleanerApp:
         # выделяется любой фрагмент, включая весь блок сразу.
         # Подписи и значения различаются тегами, а не разными
         # виджетами, поэтому колонка остаётся ровной.
+        # Фон DARK_ENTRY_BG (как у панели диагностики) визуально
+        # отделяет содержимое блока от его шапки.
         self.sysinfo_text = tk.Text(
             sysinfo_inner, height=len(self.SYSINFO_FIELDS), wrap="none",
-            font=(APP_FONT, 10), bg=DARK_BG, fg=DARK_FG, relief="flat", bd=0,
-            highlightthickness=0, insertwidth=0, cursor="xterm", padx=0, pady=0,
+            font=(APP_FONT, 10), bg=DARK_ENTRY_BG, fg=DARK_FG, relief="flat", bd=0,
+            highlightthickness=0, insertwidth=0, cursor="xterm", padx=8, pady=6,
             spacing1=2, spacing3=2,
             selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
         )
@@ -3298,28 +3311,39 @@ class CleanerApp:
         diag_outer.pack(fill="x", padx=10, pady=(0, 8))
         self.diag_card = tk.Frame(diag_outer, bg=DARK_BG)
         self.diag_card.pack(fill="x", padx=2, pady=2)
+        # Шапка устроена так же, как у блока "Система": стрелка,
+        # название, вся строка кликабельна. Отдельной кнопки
+        # "Подробнее" больше нет, а из заголовка убран текст результата
+        # ("проблем не обнаружено") — итог виден внутри блока, в разделе
+        # "Требует внимания". Остался только значок-индикатор справа,
+        # когда есть что показать.
         diag_row = tk.Frame(self.diag_card, bg=DARK_BG)
         diag_row.pack(fill="x", padx=10, pady=8)
-        self.diag_status_label = tk.Label(
-            diag_row, text="🩺  Диагностика железа: проверка…", bg=DARK_BG, fg=DARK_FG,
-            font=(APP_FONT, 11, "bold"), anchor="w", justify="left",
-        )
-        self.diag_status_label.pack(side="left")
 
-        # Кнопка оформлена как настоящая кнопка (акцентный фон, рамка),
-        # а не как приглушённая подпись: раньше было неочевидно, что на
-        # неё можно нажать и что под ней что-то есть.
         self.diag_toggle_btn = tk.Label(
-            diag_row, text="▸  Подробнее", bg=DARK_ACCENT, fg=DARK_ACCENT_TEXT,
-            font=(APP_FONT, 9, "bold"), cursor="hand2", padx=10, pady=3,
-            relief="flat", bd=0,
+            diag_row, text="▸", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 10, "bold"), cursor="hand2", padx=4,
         )
-        self.diag_toggle_btn.bind("<Button-1>", lambda e: self._toggle_diag_details())
-        self.diag_toggle_btn.bind("<Enter>", lambda e: self.diag_toggle_btn.configure(
-            bg=DARK_ETA_WARN, fg="#1a1a1a"))
-        self.diag_toggle_btn.bind("<Leave>", lambda e: self._draw_diag_toggle())
-        # Кнопка появляется только когда диагностика закончится — до тех
-        # пор разворачивать нечего.
+        self.diag_toggle_btn.pack(side="left")
+        self.diag_status_label = tk.Label(
+            diag_row, text="🩺  Диагностика железа", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 11, "bold"), anchor="w", justify="left", cursor="hand2",
+        )
+        self.diag_status_label.pack(side="left", padx=(6, 0))
+
+        # Короткий индикатор справа: число проблем или галочка. Не
+        # дублирует название блока, а дополняет его.
+        self.diag_badge_label = tk.Label(
+            diag_row, text="проверка…", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 9),
+        )
+        self.diag_badge_label.pack(side="right")
+
+        self._bind_header_hover(
+            diag_row,
+            (self.diag_toggle_btn, self.diag_status_label, self.diag_badge_label),
+            self._toggle_diag_details,
+        )
 
         self.diag_sep = tk.Frame(self.diag_card, bg=DARK_BLOCK_BORDER, height=2)
         self.diag_details_frame = tk.Frame(self.diag_card, bg=DARK_BG)
@@ -3711,6 +3735,23 @@ class CleanerApp:
             font=(APP_FONT, 9, "bold"),
         )
 
+    def _start_disk_autorefresh(self):
+        """
+        Перечитывает свободное место каждые 5 секунд, пока окно открыто.
+
+        Отдельная кнопка обновления не нужна: shutil.disk_usage — дешёвый
+        системный вызов, и опрос по таймеру всегда показывает актуальную
+        цифру, даже если файлы удалили мимо программы (через проводник,
+        другую утилиту, установку обновлений).
+
+        Слежение за событиями файловой системы (ReadDirectoryChangesW)
+        дало бы тот же результат, но потребовало бы watcher-поток на
+        каждый диск и всё равно пропускало бы изменения вне наблюдаемых
+        папок — при том что нужна одна-единственная цифра.
+        """
+        self._refresh_disk_usage_label()
+        self._disk_refresh_after_id = self.root.after(5000, self._start_disk_autorefresh)
+
     def _refresh_disk_usage_label(self):
         """
         Перерисовывает мини-индикатор заполнения диска C (полоска +
@@ -3862,17 +3903,17 @@ class CleanerApp:
         self._diag_text = text
         self._diag_problems = problems
 
+        # Название блока остаётся неизменным, результат — коротким
+        # значком справа. Раньше итог дописывался в сам заголовок, и
+        # блок назывался по-разному в зависимости от результата.
         if problems:
             word = "проблема" if len(problems) == 1 else (
                 "проблемы" if 2 <= len(problems) <= 4 else "проблем")
-            self.diag_status_label.configure(
-                text=f"🩺  Диагностика железа: {len(problems)} {word} — требует внимания",
-                fg=DARK_ETA_WARN,
+            self.diag_badge_label.configure(
+                text=f"⚠ {len(problems)} {word}", fg=DARK_ETA_WARN,
             )
         else:
-            self.diag_status_label.configure(
-                text="🩺  Диагностика железа: проблем не обнаружено", fg=DARK_FG,
-            )
+            self.diag_badge_label.configure(text="✓ проблем нет", fg="#7fbf7f")
 
         self.diag_details_text.delete("1.0", "end")
         self.diag_details_text.insert("1.0", text)
@@ -3887,7 +3928,6 @@ class CleanerApp:
             elif stripped.startswith("!"):
                 self.diag_details_text.tag_add("problem", f"{idx}.0", f"{idx}.end")
 
-        self.diag_toggle_btn.pack(side="right")
         self._draw_diag_toggle()
 
     def _copy_text_selection(self, widget, fallback):
@@ -3930,13 +3970,9 @@ class CleanerApp:
         self.root.after(1200, lambda: self.copy_diag_btn.configure(text="Копировать"))
 
     def _draw_diag_toggle(self):
-        # Развёрнуто — тёплый акцент (как у раскрытой панели служб),
-        # свёрнуто — основной красный акцент: в обоих состояниях кнопка
-        # выглядит кнопкой, а не подписью.
-        if self._diag_expanded:
-            self.diag_toggle_btn.configure(text="▾  Свернуть", bg=DARK_ETA_WARN, fg="#1a1a1a")
-        else:
-            self.diag_toggle_btn.configure(text="▸  Подробнее", bg=DARK_ACCENT, fg=DARK_ACCENT_TEXT)
+        # Стрелка в том же виде, что и у блока "Система" — отдельной
+        # кнопки "Подробнее" больше нет, разворачивает вся шапка.
+        self.diag_toggle_btn.configure(text="▾" if self._diag_expanded else "▸")
 
     def _toggle_diag_details(self):
         self._diag_expanded = not self._diag_expanded
@@ -3948,6 +3984,32 @@ class CleanerApp:
             self.diag_sep.pack_forget()
         self._draw_diag_toggle()
 
+    def _bind_header_hover(self, row, children, on_click):
+        """
+        Делает шапку сворачиваемого блока кликабельной и подсвечивает её
+        при наведении — тем же приёмом, что "О программе" и
+        "Автозагрузка" в верхней строке: меняется фон всей строки.
+
+        row — контейнер шапки, children — метки внутри неё (их фон надо
+        менять вместе с контейнером, иначе они останутся тёмными
+        прямоугольниками на подсвеченном фоне).
+        """
+        widgets = (row,) + tuple(children)
+
+        def _on(_e=None):
+            for w in widgets:
+                w.configure(bg=DARK_BG_ALT)
+
+        def _off(_e=None):
+            for w in widgets:
+                w.configure(bg=DARK_BG)
+
+        for w in widgets:
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", lambda e: on_click())
+            w.bind("<Enter>", _on)
+            w.bind("<Leave>", _off)
+
     def _toggle_sysinfo(self, _event=None):
         """
         Сворачивает/разворачивает блок "Система". Развёрнут по
@@ -3957,10 +4019,12 @@ class CleanerApp:
         """
         self._sysinfo_expanded = not self._sysinfo_expanded
         if self._sysinfo_expanded:
+            self.sysinfo_sep.pack(fill="x")
             self.sysinfo_body.pack(fill="x")
             self.sysinfo_toggle_btn.configure(text="▾")
         else:
             self.sysinfo_body.pack_forget()
+            self.sysinfo_sep.pack_forget()
             self.sysinfo_toggle_btn.configure(text="▸")
 
     def _copy_system_summary(self):
