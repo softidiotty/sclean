@@ -1,10 +1,22 @@
 # 🧹 sclean
 
+[![Release](https://img.shields.io/github/v/release/softidiotty/sclean?label=версия&color=c0392b)](https://github.com/softidiotty/sclean/releases/latest)
+[![Build](https://github.com/softidiotty/sclean/actions/workflows/release.yml/badge.svg)](https://github.com/softidiotty/sclean/actions/workflows/release.yml)
+[![Downloads](https://img.shields.io/github/downloads/softidiotty/sclean/total?label=скачиваний&color=3f8f5f)](https://github.com/softidiotty/sclean/releases)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4)](https://github.com/softidiotty/sclean/releases/latest)
+
 **Очистка и оптимизация Windows в одном окне.**
 
 Чистит диск, настраивает систему под непрерывную работу и показывает состояние железа. Делалась под моноблоки и планшеты с iikoFront, подходит для любой машины на Windows 10/11.
 
 Отмечаете нужные пункты → нажимаете «Выполнить всё отмеченное». Рядом со списком видно, сколько пунктов отмечено и сколько это займёт, а строка поиска фильтрует список по названию и описанию. Перед изменением настроек состояние сохраняется в бэкап — вернуть можно одной кнопкой. Права администратора запрашиваются при старте.
+
+## ⬇️ Скачать
+
+**[Скачать sclean.exe →](https://github.com/softidiotty/sclean/releases/latest/download/sclean.exe)**
+
+Один файл, установка не нужна. Работает на Windows 10 и 11.
+Обновляется сам — кнопка «Проверить обновление» в шапке программы.
 
 ---
 
