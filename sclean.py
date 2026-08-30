@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.15.2"
+APP_VERSION = "1.19.1"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1766,9 +1766,50 @@ def collect_hardware_diagnostics(logf=None):
         def logf(_msg):
             pass
 
-    logf("Диагностика железа и периферии...")
-    lines = ["[Диагностика железа и периферии]"]
+    logf("Диагностика железа...")
+    # Текст собирается разделами с заголовками, а не сплошным списком:
+    # так в шапке видно, где кончается одно и начинается другое.
+    lines = []
     problems = []
+
+    # --- Работа системы: аптайм и последняя загрузка ---
+    # На кассе это первое, что нужно знать: моноблок, не перезагружавшийся
+    # месяцами, копит утечки памяти и незавершённые обновления.
+    uptime_ps = (
+        "$os = Get-CimInstance Win32_OperatingSystem; "
+        "$boot = $os.LastBootUpTime; "
+        "$up = (Get-Date) - $boot; "
+        "Write-Output \"$($boot.ToString('dd.MM.yyyy HH:mm'))|$([math]::Floor($up.TotalDays))|$($up.Hours)|$($up.Minutes)\""
+    )
+    up_out = run_ps(uptime_ps, timeout=45)
+    up_line = next((l.strip() for l in (up_out or "").splitlines() if "|" in l), "")
+    lines.append("─ Система ─")
+    if up_line:
+        parts = [p.strip() for p in up_line.split("|")]
+        parts += [""] * (4 - len(parts))
+        boot_s, days_s, hours_s, mins_s = parts[:4]
+        try:
+            days, hours, mins = int(days_s), int(hours_s), int(mins_s)
+        except ValueError:
+            days = hours = mins = 0
+        if days:
+            uptime_txt = f"{days} дн {hours} ч"
+        elif hours:
+            uptime_txt = f"{hours} ч {mins} мин"
+        else:
+            uptime_txt = f"{mins} мин"
+        lines.append(f"  Без перезагрузки: {uptime_txt}")
+        lines.append(f"  Последняя загрузка: {boot_s}")
+        logf(f"  Без перезагрузки: {uptime_txt} (загружен {boot_s})")
+        if days >= 14:
+            problems.append(
+                f"система не перезагружалась {days} дн — накапливаются утечки памяти "
+                "и незавершённые обновления, стоит перезагрузить"
+            )
+    else:
+        lines.append("  Время работы: определить не удалось")
+
+    lines.append("")
 
     # --- Процессор: модель, ядра, загрузка, температура ---
     # LoadPercentage берём как мгновенный срез: на кассе фоновая
@@ -1791,22 +1832,25 @@ def collect_hardware_diagnostics(logf=None):
         parts = [p.strip() for p in cpu_line.split("|")]
         parts += [""] * (6 - len(parts))
         name, cores, threads, mhz, load, temp = parts[:6]
-        detail = f"Процессор: {name}"
+        lines.append("─ Процессор ─")
+        lines.append(f"  {name}")
+        spec = []
         if cores and threads:
-            detail += f" — {cores} ядер / {threads} потоков"
+            spec.append(f"{cores} ядер / {threads} потоков")
         if mhz:
-            detail += f", {mhz} МГц"
-        if load:
-            detail += f", загрузка {load}%"
+            spec.append(f"{mhz} МГц")
+        if spec:
+            lines.append("  " + ", ".join(spec))
+        load_line = f"  Загрузка: {load}%" if load else "  Загрузка: н/д"
         if temp:
-            detail += f", {temp} °C"
+            load_line += f"   ·   Температура: {temp} °C"
         else:
             # MSAcpi_ThermalZoneTemperature на большинстве настольных
             # плат не заполняется — это не ошибка сбора, поэтому пишем
             # прямо, а не молча опускаем температуру.
-            detail += ", температура не отдаётся платой"
-        lines.append(detail)
-        logf(f"  {detail}")
+            load_line += "   ·   Температура: не отдаётся платой"
+        lines.append(load_line)
+        logf(f"  Процессор: {name}, загрузка {load}%")
         try:
             if load and int(load) >= 90:
                 problems.append(
@@ -1821,8 +1865,11 @@ def collect_hardware_diagnostics(logf=None):
         except ValueError:
             pass
     else:
-        lines.append("Процессор: получить сведения не удалось.")
+        lines.append("─ Процессор ─")
+        lines.append("  Получить сведения не удалось")
         logf("  Процессор: получить сведения не удалось.")
+
+    lines.append("")
 
     # --- Оперативная память: объём, занято, модули ---
     ram_ps = (
@@ -1851,25 +1898,31 @@ def collect_hardware_diagnostics(logf=None):
             free_ram_gb = round(int(free_kb) / (1024 ** 2), 1)
             used_gb = round(total_gb - free_ram_gb, 1)
             used_pct = (used_gb / total_gb * 100) if total_gb else 0
-            detail = f"Оперативная память: {used_gb} из {total_gb} ГБ занято ({used_pct:.0f}%)"
+            lines.append("─ Оперативная память ─")
+            lines.append(f"  Занято: {used_gb} из {total_gb} ГБ ({used_pct:.0f}%)")
+            hw = []
             if mod_count:
-                detail += f", модулей {mod_count}"
-                if slots:
-                    detail += f" из {slots} слотов"
+                hw.append(f"модулей {mod_count}" + (f" из {slots} слотов" if slots else ""))
             if speeds:
-                detail += f", частота {speeds} МГц"
-            lines.append(detail)
-            logf(f"  {detail}")
+                # Частоты приходят через запятую по одному значению на
+                # модуль; одинаковые схлопываем, чтобы не было "3200,3200".
+                uniq = sorted({s.strip() for s in speeds.split(",") if s.strip()})
+                hw.append(f"частота {'/'.join(uniq)} МГц")
+            if hw:
+                lines.append("  " + ", ".join(hw))
+            logf(f"  Память: занято {used_gb} из {total_gb} ГБ ({used_pct:.0f}%)")
             if used_pct >= 90:
                 problems.append(
                     f"оперативная память занята на {used_pct:.0f}% — система уходит в файл "
                     "подкачки и заметно тормозит"
                 )
         except (ValueError, ZeroDivisionError):
-            lines.append("Оперативная память: получить сведения не удалось.")
+            lines.append("─ Оперативная память ─")
+            lines.append("  Получить сведения не удалось")
             logf("  Оперативная память: получить сведения не удалось.")
     else:
-        lines.append("Оперативная память: получить сведения не удалось.")
+        lines.append("─ Оперативная память ─")
+        lines.append("  Получить сведения не удалось")
         logf("  Оперативная память: получить сведения не удалось.")
 
     # --- Результаты встроенной диагностики памяти Windows ---
@@ -1895,7 +1948,7 @@ def collect_hardware_diagnostics(logf=None):
         bad = (event_id.strip() == "1202" or "обнаруж" in message.lower()
                or "error" in message.lower())
         verdict = "обнаружены ошибки" if bad else "ошибок не найдено"
-        lines.append(f"Тест памяти Windows: {verdict} (проверка от {date_s})")
+        lines.append(f"  Тест памяти Windows: {verdict} (от {date_s})")
         logf(f"  Тест памяти Windows от {date_s}: {verdict}.")
         if bad:
             problems.append(
@@ -1903,8 +1956,10 @@ def collect_hardware_diagnostics(logf=None):
                 "стоит проверить модули памяти (mdsched.exe)"
             )
     else:
-        lines.append("Тест памяти Windows: не запускался (mdsched.exe).")
+        lines.append("  Тест памяти Windows: не запускался (mdsched.exe)")
         logf("  Тест памяти Windows ранее не запускался.")
+
+    lines.append("")
 
     # --- Диски: здоровье, тип, температура ---
     disk_ps = (
@@ -1917,6 +1972,7 @@ def collect_hardware_diagnostics(logf=None):
     )
     disk_out = run_ps(disk_ps, timeout=90)
     any_disk = False
+    lines.append("─ Накопители ─")
     for line in (disk_out or "").splitlines():
         parts = line.strip().split("|")
         if len(parts) < 4 or not parts[0].strip():
@@ -1924,9 +1980,13 @@ def collect_hardware_diagnostics(logf=None):
         any_disk = True
         name, health, media, size = (p.strip() for p in parts[:4])
         temp = parts[4].strip() if len(parts) > 4 else ""
-        extra = f", {temp} °C" if temp else ""
-        lines.append(f"Диск: {name} — {size} ГБ, {media or 'тип неизвестен'}, состояние: {health}{extra}")
-        logf(f"  Диск {name}: {health}, {size} ГБ{extra}")
+        health_ru = "исправен" if health.lower() in ("healthy", "работоспособен", "исправен") else health
+        lines.append(f"  {name}")
+        detail = f"    {size} ГБ, {media or 'тип неизвестен'}   ·   Состояние: {health_ru}"
+        if temp:
+            detail += f"   ·   {temp} °C"
+        lines.append(detail)
+        logf(f"  Диск {name}: {health_ru}, {size} ГБ")
         if health and health.lower() not in ("healthy", "работоспособен", "исправен"):
             problems.append(f"диск {name} сообщает о состоянии «{health}» — стоит проверить и заранее заменить")
         try:
@@ -1935,10 +1995,14 @@ def collect_hardware_diagnostics(logf=None):
         except ValueError:
             pass
     if not any_disk:
-        lines.append("Диски: получить сведения не удалось.")
+        lines.append("  Получить сведения не удалось")
         logf("  Диски: получить сведения не удалось.")
 
     # --- Свободное место по всем разделам ---
+    # Раздел "Разделы" из ТЕКСТА диагностики убран: заполнение диска C
+    # и так показано крупной полосой в шапке, а дублировать её списком
+    # было лишним. Запрос остался — он нужен, чтобы поймать нехватку
+    # места на любом разделе и вынести это в "Требует внимания".
     vol_ps = (
         "foreach ($v in @(Get-Volume -ErrorAction SilentlyContinue | "
         "  Where-Object { $_.DriveLetter -and $_.Size -gt 0 })) { "
@@ -1960,7 +2024,6 @@ def collect_hardware_diagnostics(logf=None):
         except ValueError:
             continue
         pct_free = (free_v / total_v * 100) if total_v else 0
-        lines.append(f"Раздел {letter}: свободно {free_v} из {total_v} ГБ ({pct_free:.0f}%)")
         logf(f"  Раздел {letter}: свободно {free_v} / {total_v} ГБ ({pct_free:.0f}%)")
         if pct_free < 10:
             problems.append(
@@ -1968,41 +2031,17 @@ def collect_hardware_diagnostics(logf=None):
                 "Windows начнёт тормозить и может не установить обновления"
             )
 
-    # --- Устройства с ошибками в диспетчере устройств ---
-    err_ps = (
-        "foreach ($d in @(Get-PnpDevice -ErrorAction SilentlyContinue | "
-        "  Where-Object { $_.Status -ne 'OK' -and $_.Status -ne 'Unknown' -and $_.Present })) { "
-        "  Write-Output ($d.FriendlyName + '|' + $d.Status + '|' + $d.Class) "
-        "}"
-    )
-    err_out = run_ps(err_ps, timeout=90)
-    bad_devices = [l.strip() for l in (err_out or "").splitlines() if l.strip() and "|" in l]
-    if bad_devices:
-        lines.append(f"Устройства с ошибками: {len(bad_devices)}")
-        logf(f"  Устройств с ошибками в диспетчере: {len(bad_devices)}")
-        for entry in bad_devices[:15]:
-            name, _, rest = entry.partition("|")
-            status, _, cls = rest.partition("|")
-            lines.append(f"  - {name.strip()} ({cls.strip() or 'без класса'}): {status.strip()}")
-            logf(f"    - {name.strip()}: {status.strip()}")
-        problems.append(
-            f"в диспетчере устройств {len(bad_devices)} устройств(а) с ошибкой — "
-            "обычно не встал драйвер"
-        )
-    else:
-        lines.append("Устройства с ошибками: нет.")
-        logf("  Устройств с ошибками в диспетчере нет.")
-
-    # Список подключённой USB-периферии здесь раньше выводился целиком
-    # (15+ строк вида "USB-устройство ввода") — он занимал больше места,
-    # чем всё остальное вместе, и ничего не говорил: имена у HID-устройств
-    # обезличенные. Убран: что подключено, видно в диспетчере устройств,
-    # а для диагностики важны только устройства С ОШИБКАМИ (выше).
+    # Разделы диспетчера устройств и списка USB-периферии убраны по
+    # просьбе: первый почти всегда показывал служебные VPN-адаптеры
+    # (Radmin, Fortinet), которые висят со статусом Error штатно и
+    # ничего не значат для кассы; второй занимал больше места, чем весь
+    # остальной блок, строками вида "USB-устройство ввода".
+    # Что подключено и что не встало — видно в самом диспетчере устройств.
 
     # --- Итог ---
     if problems:
         lines.append("")
-        lines.append("Требует внимания:")
+        lines.append("─ Требует внимания ─")
         logf(f"  Найдено проблем: {len(problems)}.")
         for p in problems:
             lines.append(f"  ! {p}")
@@ -2535,10 +2574,16 @@ DARK_BORDER = "#4a4a4d"
 # цвета: блоки визуально разделены, но не конкурируют за внимание с
 # красной подсветкой выбранных пунктов.
 DARK_BLOCK_BORDER = "#4a4a4d"
-# Акцент для ETA долгих пунктов (>60 сек) — тёплый жёлто-оранжевый,
-# заметный на тёмном фоне, но не конкурирующий с красным DARK_ACCENT
-# выбранных строк. Используется только для текста времени, не для фона.
-DARK_ETA_WARN = "#d9a441"
+# Акцент внимания: долгие пункты, найденные проблемы, раскрытые панели,
+# переполненный диск. Раньше был тёплым жёлто-оранжевым (#d9a441) —
+# заменён на красный, в тон основному DARK_ACCENT. Взят светлее и
+# насыщеннее самого DARK_ACCENT, чтобы читаться и как текст на тёмном
+# фоне, и как фон под тёмной надписью.
+DARK_ETA_WARN = "#e05260"
+# Цвета для полосы заполнения диска: свободная часть — спокойный
+# зелёный, занятая — красный акцент. Разными цветами видно не только
+# сколько занято, но и сколько осталось.
+DARK_DISK_FREE = "#3f8f5f"
 
 
 class Tooltip:
@@ -2870,6 +2915,27 @@ class CleanerApp:
             # Прокрутка колесом мыши в любом месте окна. delta положителен
             # при прокрутке вверх на Windows — делим на 120 (шаг колеса) и
             # инвертируем знак для естественного направления.
+            #
+            # Исключение — панели с собственной прокруткой (диагностика
+            # и журнал выполнения): пока курсор над такой панелью,
+            # колесо должно листать именно её, а не всё окно. Иначе
+            # прочитать длинный блок невозможно: окно уезжает раньше,
+            # чем текст.
+            try:
+                under_cursor = event.widget.winfo_containing(event.x_root, event.y_root)
+            except Exception:
+                under_cursor = None
+            for widget in getattr(self, "_scroll_isolated_widgets", ()):
+                if under_cursor is widget:
+                    # Если панель уже прокручена до края — отдаём событие
+                    # окну, чтобы прокрутка не "залипала" на границе.
+                    first, last = widget.yview()
+                    scrolling_up = event.delta > 0
+                    at_edge = (scrolling_up and first <= 0.0) or (not scrolling_up and last >= 1.0)
+                    if not at_edge:
+                        widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                        return "break"
+                    break
             self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
         self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
@@ -2884,8 +2950,11 @@ class CleanerApp:
         block1 = tk.Frame(block1_outer, bg=DARK_BG)
         block1.pack(fill="x", padx=2, pady=2)
 
+        # Сохраняем в self: панель "О программе" разворачивается сразу
+        # после этой строки (after=self.header_frame).
         header_frame = ttk.Frame(block1)
         header_frame.pack(fill="x", padx=8, pady=(8, 0))
+        self.header_frame = header_frame
 
         self._logo_img = None
         try:
@@ -2951,6 +3020,41 @@ class CleanerApp:
 
         self.update_btn = ttk.Button(header_frame, text="Проверить обновление", command=self.check_update_clicked)
         self.update_btn.pack(side="right")
+
+        # "О программе" переехала сюда, к названию и версии: это
+        # справка о самой программе, ей логичнее быть в её же строке,
+        # а не между сведениями о системе и списком задач, где она
+        # разрывала связанные блоки.
+        self._about_expanded = False
+        self.about_toggle_btn = tk.Label(
+            header_frame, text="ⓘ О программе", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 8), cursor="hand2", padx=6, pady=2,
+        )
+        self.about_toggle_btn.pack(side="right", padx=(0, 8))
+        self.about_toggle_btn.bind("<Button-1>", lambda e: self._toggle_about())
+        self.about_toggle_btn.bind("<Enter>", lambda e: self.about_toggle_btn.configure(
+            bg=DARK_BG_ALT, fg=DARK_ETA_WARN) if not self._about_expanded else None)
+        self.about_toggle_btn.bind("<Leave>", lambda e: self._draw_about_toggle())
+
+        # Автозагрузка свёрнута из отдельной карточки в одну кнопку
+        # рядом с "О программе": она только открывает две папки в
+        # проводнике, целого блока под это не нужно.
+        self.startup_btn = tk.Label(
+            header_frame, text="🚀 Автозагрузка", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 8), cursor="hand2", padx=6, pady=2,
+        )
+        self.startup_btn.pack(side="right", padx=(0, 8))
+        self.startup_btn.bind("<Button-1>", lambda e: self._open_startup_folders())
+        self.startup_btn.bind("<Enter>", lambda e: self.startup_btn.configure(
+            bg=DARK_BG_ALT, fg=DARK_ETA_WARN))
+        self.startup_btn.bind("<Leave>", lambda e: self.startup_btn.configure(
+            bg=DARK_BG, fg=DARK_FG_DIM))
+        Tooltip(
+            self.startup_btn,
+            "Открыть папки автозагрузки текущего пользователя и всех\n"
+            "пользователей. Программа ничего не удаляет — убираете сами.",
+        )
+
         self.update_status_label = ttk.Label(header_frame, text="", style="Dim.TLabel")
         self.update_status_label.pack(side="right", padx=(0, 8))
         self._pending_release = None
@@ -2964,60 +3068,109 @@ class CleanerApp:
         # обратную связь на клик (обычная подсветка hover/click на
         # tk.Canvas+ttk.Label иначе незаметна, в отличие от кнопок и
         # текстовых ссылок в шапке, где меняется цвет самого текста).
-        self.disk_usage_row = tk.Frame(block1, bg=DARK_BG, highlightthickness=1, highlightbackground=DARK_BORDER)
-        self.disk_usage_row.pack(fill="x", padx=8, pady=(2, 0))
-        disk_usage_inner = tk.Frame(self.disk_usage_row, bg=DARK_BG)
-        disk_usage_inner.pack(fill="x", padx=6, pady=3)
-        self.disk_usage_canvas = tk.Canvas(
-            disk_usage_inner, width=120, height=10, bg=DARK_ENTRY_BG, highlightthickness=0, bd=0,
+        # Панель "О программе" создаётся сразу под строкой с названием и
+        # кнопкой, поэтому разворачивается ровно там, где на неё нажали,
+        # а не где-то ниже по окну, где её было легко потерять.
+        self.about_frame = tk.Frame(block1, bg=DARK_BG, highlightthickness=1, highlightbackground=DARK_ETA_WARN)
+        # Не .pack() здесь — показывается только при разворачивании.
+        about_inner = tk.Frame(self.about_frame, bg=DARK_BG)
+        about_inner.pack(fill="x", padx=10, pady=8)
+
+        log_dir_hint = os.path.join("Рабочий стол", "sclean")
+        tk.Label(
+            about_inner, text=f"ⓘ  О программе {APP_NAME} {APP_VERSION}",
+            bg=DARK_BG, fg=DARK_FG, font=(APP_FONT, 9, "bold"), anchor="w",
+        ).pack(anchor="w", pady=(0, 4))
+        about_text = (
+            "Отмечаете нужные пункты списка ниже (или выполняете каждый по отдельности)\n"
+            "и запускаете: программа чистит систему и меняет настройки Windows одним\n"
+            "нажатием.\n\n"
+            "Перед изменением настроек текущее состояние сохраняется в бэкап — вернуть\n"
+            "обратно можно кнопкой «Бэкап» внизу окна.\n\n"
+            f"Отчёт о каждом запуске сохраняется в папку «{log_dir_hint}»."
         )
-        self.disk_usage_canvas.pack(side="left", pady=2)
-        self.disk_usage_label = ttk.Label(disk_usage_inner, text="", style="Dim.TLabel", font=(APP_FONT, 8))
-        self.disk_usage_label.pack(side="left", padx=(6, 0))
+        tk.Label(
+            about_inner, text=about_text, bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 8), justify="left", anchor="w",
+        ).pack(anchor="w")
+
+        # ------------------------------------------------------------------
+        # Блок "Диск C" — отдельный блок верхнего уровня со своей рамкой,
+        # как список пунктов и панель выполнения. Раньше диск, "Система"
+        # и "Диагностика" лежали внутри одной общей рамки и читались как
+        # один блок с внутренними карточками.
+        # ------------------------------------------------------------------
+        disk_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
+        disk_outer.pack(fill="x", padx=10, pady=(0, 8))
+        self.disk_usage_row = tk.Frame(disk_outer, bg=DARK_BG)
+        self.disk_usage_row.pack(fill="x", padx=2, pady=2)
+        disk_usage_inner = tk.Frame(self.disk_usage_row, bg=DARK_BG)
+        disk_usage_inner.pack(fill="x", padx=10, pady=8)
+
+        disk_top_row = tk.Frame(disk_usage_inner, bg=DARK_BG)
+        disk_top_row.pack(fill="x", pady=(0, 6))
+        self.disk_usage_label = tk.Label(
+            disk_top_row, text="", bg=DARK_BG, fg=DARK_FG, font=(APP_FONT, 10, "bold"),
+            anchor="w",
+        )
+        self.disk_usage_label.pack(side="left")
+        self.disk_usage_hint = tk.Label(
+            disk_top_row, text="открыть в проводнике", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 8),
+        )
+        self.disk_usage_hint.pack(side="right")
+
+        disk_bar_row = tk.Frame(disk_usage_inner, bg=DARK_BG)
+        disk_bar_row.pack(fill="x", pady=(4, 0))
+        self.disk_usage_canvas = tk.Canvas(
+            disk_bar_row, width=220, height=18, bg=DARK_ENTRY_BG, highlightthickness=0, bd=0,
+        )
+        self.disk_usage_canvas.pack(side="left")
+        self.disk_free_label = tk.Label(
+            disk_bar_row, text="", bg=DARK_BG, fg=DARK_FG, font=(APP_FONT, 9, "bold"),
+        )
+        self.disk_free_label.pack(side="left", padx=(10, 0))
         self._refresh_disk_usage_label()
 
         # Клик по индикатору открывает диск C: в проводнике. Hover
         # подсвечивает рамку и фон акцентным цветом, а сам клик даёт
         # короткую вспышку (_flash_disk_usage_row) — вместе понятно, что
         # элемент кликабельный и клик сработал, даже без смены курсора.
+        _disk_bg_widgets = (
+            disk_usage_inner, disk_top_row, disk_bar_row,
+            self.disk_usage_label, self.disk_usage_hint, self.disk_free_label,
+        )
+
         def _disk_hover_on(_e=None):
-            self.disk_usage_row.configure(highlightbackground=DARK_ACCENT_TEXT, bg=DARK_BG_ALT)
-            disk_usage_inner.configure(bg=DARK_BG_ALT)
-            self.disk_usage_label.configure(background=DARK_BG_ALT)
+            # Подсвечиваем внешнюю рамку блока: сама строка теперь без
+            # собственной границы, она у блока верхнего уровня.
+            disk_outer.configure(bg=DARK_ETA_WARN)
+            self.disk_usage_row.configure(bg=DARK_BG_ALT)
+            for w in _disk_bg_widgets:
+                w.configure(bg=DARK_BG_ALT)
+            self.disk_usage_hint.configure(fg=DARK_ETA_WARN)
 
         def _disk_hover_off(_e=None):
-            self.disk_usage_row.configure(highlightbackground=DARK_BORDER, bg=DARK_BG)
-            disk_usage_inner.configure(bg=DARK_BG)
-            self.disk_usage_label.configure(background=DARK_BG)
+            disk_outer.configure(bg=DARK_BLOCK_BORDER)
+            self.disk_usage_row.configure(bg=DARK_BG)
+            for w in _disk_bg_widgets:
+                w.configure(bg=DARK_BG)
+            self.disk_usage_hint.configure(fg=DARK_FG_DIM)
 
         def _disk_click(_e=None):
             os.startfile("C:\\")
             self._flash_disk_usage_row()
 
-        for widget in (self.disk_usage_row, disk_usage_inner, self.disk_usage_canvas, self.disk_usage_label):
+        # Подсказки при наведении здесь нет: подпись "открыть в
+        # проводнике" видна прямо в строке и не перекрывает соседние
+        # элементы, в отличие от всплывающего окна.
+        for widget in (self.disk_usage_row, disk_usage_inner, disk_top_row, disk_bar_row,
+                       self.disk_usage_canvas, self.disk_usage_label,
+                       self.disk_usage_hint, self.disk_free_label):
             widget.configure(cursor="hand2")
             widget.bind("<Button-1>", _disk_click)
             widget.bind("<Enter>", _disk_hover_on)
             widget.bind("<Leave>", _disk_hover_off)
-            Tooltip(widget, "Открыть диск C: в проводнике")
-
-        # Кнопка автозагрузки: раньше "Оптимизация автозапуска" была
-        # отдельным пунктом списка, автоматически отключавшим известное
-        # ПО по жёстко зашитому списку (OneDrive/Skype/...) — заменена на
-        # прямое открытие обеих папок автозагрузки в проводнике, чтобы
-        # пользователь сам решал, что удалять/оставлять, без риска задеть
-        # что-то нужное на конкретном моноблоке.
-        startup_row = ttk.Frame(block1)
-        startup_row.pack(fill="x", padx=8, pady=(4, 0))
-        startup_btn = ttk.Button(
-            startup_row, text="🚀 Открыть папки автозагрузки", command=self._open_startup_folders,
-        )
-        startup_btn.pack(side="left")
-        Tooltip(
-            startup_btn,
-            "Открывает 2 папки автозагрузки в проводнике — для текущего пользователя\n"
-            "и для всех пользователей. Удалить ненужные ярлыки можно вручную.",
-        )
 
         # Краткая сводка о системе (ОС/CPU/RAM/плата) — раньше это был
         # отдельный пункт списка "Сбор информации о системе", теперь
@@ -3031,16 +3184,71 @@ class CleanerApp:
         # подписи: без рамки, с фоном блока, невысокий, без курсора
         # ввода. Правка запрещена не через state="disabled" (это
         # блокирует и выделение), а перехватом нажатий клавиш.
-        system_summary_row = ttk.Frame(block1)
-        system_summary_row.pack(fill="x", padx=8, pady=(4, 6))
-        self.system_summary_text = tk.Text(
-            system_summary_row, height=2, wrap="word", font=(APP_FONT, 8),
-            bg=DARK_BG, fg=DARK_FG_DIM, relief="flat", bd=0, highlightthickness=0,
-            insertwidth=0, cursor="xterm", padx=0, pady=0,
+        # Каждый параметр — отдельная строка с подписью в колонку, а не
+        # сплошной текст: так значения выровнены и читаются списком.
+        # Значения по-прежнему доступны для копирования, но уже целиком
+        # кнопкой (выделять по одному не требуется).
+        # ------------------------------------------------------------------
+        # Блок "Система" — отдельный сворачиваемый блок верхнего уровня.
+        # ------------------------------------------------------------------
+        sysinfo_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
+        sysinfo_outer.pack(fill="x", padx=10, pady=(0, 8))
+        sysinfo_card = tk.Frame(sysinfo_outer, bg=DARK_BG)
+        sysinfo_card.pack(fill="x", padx=2, pady=2)
+
+        sysinfo_head = tk.Frame(sysinfo_card, bg=DARK_BG)
+        sysinfo_head.pack(fill="x", padx=10, pady=8)
+
+        self._sysinfo_expanded = True
+        self.sysinfo_toggle_btn = tk.Label(
+            sysinfo_head, text="▾", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 10, "bold"), cursor="hand2", padx=4,
+        )
+        self.sysinfo_toggle_btn.pack(side="left")
+        sysinfo_title = tk.Label(
+            sysinfo_head, text="🖥  Система", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 11, "bold"), cursor="hand2",
+        )
+        sysinfo_title.pack(side="left", padx=(6, 0))
+        for w in (self.sysinfo_toggle_btn, sysinfo_title, sysinfo_head):
+            w.bind("<Button-1>", lambda e: self._toggle_sysinfo())
+
+        # Подсказки при наведении на кнопках "Копировать" нет: надпись
+        # и так говорит, что делает кнопка, а всплывающее окно только
+        # перекрывало соседние строки.
+        self.copy_summary_btn = ttk.Button(
+            sysinfo_head, text="Копировать", width=12, command=self._copy_system_summary,
+        )
+        self.copy_summary_btn.pack(side="right")
+
+        tk.Frame(sysinfo_card, bg=DARK_BLOCK_BORDER, height=2).pack(fill="x")
+
+        self.sysinfo_body = tk.Frame(sysinfo_card, bg=DARK_BG)
+        self.sysinfo_body.pack(fill="x")
+        sysinfo_inner = tk.Frame(self.sysinfo_body, bg=DARK_BG)
+        sysinfo_inner.pack(fill="x", padx=10, pady=8)
+
+        # Весь блок — ОДИН Text, а не отдельные Entry по строкам:
+        # в наборе Entry выделение живёт внутри каждого поля, и
+        # протянуть его через несколько строк невозможно. В Text
+        # выделяется любой фрагмент, включая весь блок сразу.
+        # Подписи и значения различаются тегами, а не разными
+        # виджетами, поэтому колонка остаётся ровной.
+        self.sysinfo_text = tk.Text(
+            sysinfo_inner, height=len(self.SYSINFO_FIELDS), wrap="none",
+            font=(APP_FONT, 10), bg=DARK_BG, fg=DARK_FG, relief="flat", bd=0,
+            highlightthickness=0, insertwidth=0, cursor="xterm", padx=0, pady=0,
+            spacing1=2, spacing3=2,
             selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
         )
-        self.system_summary_text.insert("1.0", "Сведения о системе: загрузка…")
-        self.system_summary_text.pack(side="left", fill="x", expand=True)
+        self.sysinfo_text.pack(fill="x")
+        self.sysinfo_text.tag_configure(
+            "caption", foreground=DARK_FG_DIM, font=(APP_FONT, 9))
+        self.sysinfo_text.tag_configure(
+            "value", foreground=DARK_FG, font=(APP_FONT, 10, "bold"))
+        # Табуляция выравнивает значения в колонку независимо от длины
+        # подписи — так же ровно, как это делал grid.
+        self.sysinfo_text.configure(tabs=("95p",))
 
         def _summary_keypress(event):
             # Пропускаем только копирование и выделение всего текста,
@@ -3052,19 +3260,28 @@ class CleanerApp:
                 return None
             return "break"
 
-        self.system_summary_text.bind("<Key>", _summary_keypress)
-        self.system_summary_text.bind("<Control-a>", lambda e: (
-            self.system_summary_text.tag_add("sel", "1.0", "end-1c"), "break")[1])
-        # Подсказки при наведении здесь намеренно нет: всплывающее окно
-        # перекрывало сам текст сводки ровно в тот момент, когда его
-        # пытаются выделить мышью. Про возможность копирования говорит
-        # кнопка "Копировать" рядом.
+        self.sysinfo_text.bind("<Key>", _summary_keypress)
+        self.sysinfo_text.bind("<Control-a>", lambda e: (
+            self.sysinfo_text.tag_add("sel", "1.0", "end-1c"), "break")[1])
 
-        self.copy_summary_btn = ttk.Button(
-            system_summary_row, text="Копировать", width=12, command=self._copy_system_summary,
+        sysinfo_menu = tk.Menu(self.sysinfo_text, tearoff=0)
+        sysinfo_menu.add_command(
+            label="Копировать выделенное",
+            command=lambda: self._copy_text_selection(self.sysinfo_text, self._copy_system_summary),
         )
-        self.copy_summary_btn.pack(side="right", padx=(6, 0))
-        Tooltip(self.copy_summary_btn, "Скопировать сведения о системе в буфер обмена")
+        sysinfo_menu.add_command(label="Выделить всё", command=lambda: (
+            self.sysinfo_text.focus_set(),
+            self.sysinfo_text.tag_add("sel", "1.0", "end-1c")))
+        sysinfo_menu.add_separator()
+        sysinfo_menu.add_command(label="Копировать всё", command=self._copy_system_summary)
+
+        def _show_sysinfo_menu(event):
+            try:
+                sysinfo_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                sysinfo_menu.grab_release()
+
+        self.sysinfo_text.bind("<Button-3>", _show_sysinfo_menu)
 
         threading.Thread(target=self._load_system_summary_async, daemon=True).start()
 
@@ -3074,89 +3291,133 @@ class CleanerApp:
         # сведениями о системе и выполняться самой при старте.
         # В свёрнутом виде — одна строка с итогом (или числом проблем),
         # по кнопке разворачивается полный текст.
-        diag_row = tk.Frame(block1, bg=DARK_BG)
-        diag_row.pack(fill="x", padx=8, pady=(0, 2))
+        # ------------------------------------------------------------------
+        # Блок "Диагностика железа" — отдельный блок верхнего уровня.
+        # ------------------------------------------------------------------
+        diag_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
+        diag_outer.pack(fill="x", padx=10, pady=(0, 8))
+        self.diag_card = tk.Frame(diag_outer, bg=DARK_BG)
+        self.diag_card.pack(fill="x", padx=2, pady=2)
+        diag_row = tk.Frame(self.diag_card, bg=DARK_BG)
+        diag_row.pack(fill="x", padx=10, pady=8)
         self.diag_status_label = tk.Label(
-            diag_row, text="🩺 Диагностика железа: проверка…", bg=DARK_BG, fg=DARK_FG_DIM,
-            font=(APP_FONT, 8), anchor="w", justify="left",
+            diag_row, text="🩺  Диагностика железа: проверка…", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 11, "bold"), anchor="w", justify="left",
         )
         self.diag_status_label.pack(side="left")
 
+        # Кнопка оформлена как настоящая кнопка (акцентный фон, рамка),
+        # а не как приглушённая подпись: раньше было неочевидно, что на
+        # неё можно нажать и что под ней что-то есть.
         self.diag_toggle_btn = tk.Label(
-            diag_row, text="▸ Подробнее", bg=DARK_BG, fg=DARK_FG_DIM,
-            font=(APP_FONT, 8, "bold"), cursor="hand2", padx=6, pady=1,
+            diag_row, text="▸  Подробнее", bg=DARK_ACCENT, fg=DARK_ACCENT_TEXT,
+            font=(APP_FONT, 9, "bold"), cursor="hand2", padx=10, pady=3,
+            relief="flat", bd=0,
         )
         self.diag_toggle_btn.bind("<Button-1>", lambda e: self._toggle_diag_details())
         self.diag_toggle_btn.bind("<Enter>", lambda e: self.diag_toggle_btn.configure(
-            bg=DARK_BG_ALT, fg=DARK_ETA_WARN) if not self._diag_expanded else None)
+            bg=DARK_ETA_WARN, fg="#1a1a1a"))
         self.diag_toggle_btn.bind("<Leave>", lambda e: self._draw_diag_toggle())
         # Кнопка появляется только когда диагностика закончится — до тех
         # пор разворачивать нечего.
 
-        # Копирование всей диагностики одной кнопкой — тот же приём, что
-        # и у сведений о системе выше: выделять мышью многострочный блок
-        # неудобно, а переслать результат нужно как раз целиком.
-        # Показывается вместе с кнопкой "Подробнее", по готовности.
-        self.copy_diag_btn = ttk.Button(
-            diag_row, text="Копировать", width=12, command=self._copy_diagnostics,
-        )
-        Tooltip(self.copy_diag_btn, "Скопировать результат диагностики железа в буфер обмена")
+        self.diag_sep = tk.Frame(self.diag_card, bg=DARK_BLOCK_BORDER, height=2)
+        self.diag_details_frame = tk.Frame(self.diag_card, bg=DARK_BG)
 
-        self.diag_details_frame = tk.Frame(block1, bg=DARK_BG)
-        # height задаётся динамически по фактическому числу строк (см.
-        # _apply_hardware_diagnostics): после того как из блока убрали
-        # список USB-периферии, он помещается целиком, и прокрутка
-        # больше не нужна — а именно на неё жаловались.
+        # Текст с прокруткой: содержимое зависит от числа дисков и
+        # найденных проблем, и на маленьком окне могло не помещаться.
+        diag_text_wrap = tk.Frame(self.diag_details_frame, bg=DARK_BG)
+        diag_text_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 0))
+        diag_scroll = ttk.Scrollbar(diag_text_wrap, orient="vertical")
+        diag_scroll.pack(side="right", fill="y")
         self.diag_details_text = tk.Text(
-            self.diag_details_frame, height=8, wrap="word", font=(APP_FONT, 8),
-            bg=DARK_ENTRY_BG, fg=DARK_FG_DIM, relief="flat", bd=0, highlightthickness=1,
+            diag_text_wrap, height=12, wrap="word", font=(APP_FONT, 9),
+            bg=DARK_ENTRY_BG, fg=DARK_FG, relief="flat", bd=0, highlightthickness=1,
             highlightbackground=DARK_BORDER, insertwidth=0, cursor="xterm",
+            padx=8, pady=6,
             selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
+            yscrollcommand=diag_scroll.set,
         )
-        self.diag_details_text.pack(fill="both", expand=True, padx=2, pady=2)
+        self.diag_details_text.pack(side="left", fill="both", expand=True)
+        diag_scroll.configure(command=self.diag_details_text.yview)
+        # Колесо над этой панелью листает её, а не всё окно.
+        self._scroll_isolated_widgets = getattr(self, "_scroll_isolated_widgets", [])
+        self._scroll_isolated_widgets.append(self.diag_details_text)
+
+        # Заголовки разделов внутри текста — цветом и полужирным, чтобы
+        # блок читался структурой, а не сплошной простынёй.
+        self.diag_details_text.tag_configure(
+            "section", foreground=DARK_ETA_WARN, font=(APP_FONT, 9, "bold"), spacing1=4)
+        self.diag_details_text.tag_configure(
+            "problem", foreground=DARK_ETA_WARN)
         self.diag_details_text.bind("<Key>", _summary_keypress)
+        self.diag_details_text.bind("<Control-a>", lambda e: (
+            self.diag_details_text.tag_add("sel", "1.0", "end-1c"), "break")[1])
+
+        # Контекстное меню по правой кнопке — привычный способ
+        # скопировать выделенное, помимо Ctrl+C.
+        self.diag_menu = tk.Menu(self.diag_details_text, tearoff=0)
+        self.diag_menu.add_command(label="Копировать выделенное",
+                                   command=self._copy_diag_selection)
+        self.diag_menu.add_command(label="Выделить всё", command=lambda: (
+            self.diag_details_text.focus_set(),
+            self.diag_details_text.tag_add("sel", "1.0", "end-1c")))
+        self.diag_menu.add_separator()
+        self.diag_menu.add_command(label="Копировать всю диагностику",
+                                   command=self._copy_diagnostics)
+
+        def _show_diag_menu(event):
+            try:
+                self.diag_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.diag_menu.grab_release()
+
+        self.diag_details_text.bind("<Button-3>", _show_diag_menu)
+
+        # Кнопка копирования — внизу блока, под текстом: сверху она
+        # visually относилась к строке-заголовку, хотя копирует
+        # содержимое панели.
+        diag_actions_row = tk.Frame(self.diag_details_frame, bg=DARK_BG)
+        diag_actions_row.pack(fill="x", padx=2, pady=(4, 2))
+        self.copy_diag_btn = ttk.Button(
+            diag_actions_row, text="Копировать", width=14, command=self._copy_diagnostics,
+        )
+        self.copy_diag_btn.pack(side="left")
+        tk.Label(
+            diag_actions_row, text="или выделите мышью и нажмите Ctrl+C",
+            bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 8),
+        ).pack(side="left", padx=(10, 0))
 
         self._diag_expanded = False
         self._diag_text = ""
         self._diag_problems = []
         threading.Thread(target=self._load_hardware_diagnostics_async, daemon=True).start()
 
-        # Сворачиваемое краткое описание программы: что делает и где
-        # сохраняется лог. Свёрнуто по умолчанию, чтобы не занимать место
-        # у постоянных пользователей — разворачивается по клику на "ⓘ О программе".
-        self.about_toggle_row = ttk.Frame(block1)
-        self.about_toggle_row.pack(fill="x", padx=8, pady=(2, 0))
-        self._about_expanded = False
-        self.about_toggle_btn = ttk.Label(
-            self.about_toggle_row, text="▸ ⓘ О программе", style="Dim.TLabel", cursor="hand2",
-        )
-        self.about_toggle_btn.pack(anchor="w")
-        self.about_toggle_btn.bind("<Button-1>", lambda e: self._toggle_about())
+        # ------------------------------------------------------------------
+        # Блок 2: выбор и сами пункты выполнения. Заголовок "Выберите
+        # пункты" и строка управления (мастер-чекбокс + пресет) теперь
+        # ВНУТРИ этого блока, а не в шапке: раньше они стояли в блоке со
+        # сведениями о системе, из-за чего заголовок относился визуально
+        # к диагностике, а не к списку, который он подписывает.
+        # ------------------------------------------------------------------
+        steps_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
+        steps_outer.pack(fill="x", padx=10, pady=(0, 8))
 
-        self.about_frame = ttk.Frame(block1)
-        # Не .pack() здесь — показывается только при разворачивании.
+        steps_block = tk.Frame(steps_outer, bg=DARK_BG)
+        steps_block.pack(fill="x", padx=2, pady=2)
 
-        log_dir_hint = os.path.join("Рабочий стол", "sclean")
-        about_text = (
-            f"{APP_NAME} — отмечаете нужные пункты списка ниже (или выполняете каждый\n"
-            "по отдельности) и запускаете: программа чистит систему и/или меняет\n"
-            "настройки Windows одним нажатием. Перед изменением настроек текущее\n"
-            "состояние сохраняется в бэкап — можно вернуть обратно кнопкой «Бэкап».\n"
-            f"Отчёт о каждом запуске сохраняется в папку \"{log_dir_hint}\"."
-        )
-        ttk.Label(
-            self.about_frame, text=about_text, style="Dim.TLabel", justify="left",
-        ).pack(anchor="w", padx=(16, 0), pady=(2, 6))
-
-        top_frame = ttk.Frame(block1)
-        top_frame.pack(fill="x", padx=8, pady=(6, 0))
-        ttk.Label(top_frame, text="Выберите пункты для выполнения:", style="Header.TLabel").pack(anchor="w")
+        top_frame = tk.Frame(steps_block, bg=DARK_BG)
+        top_frame.pack(fill="x", padx=8, pady=(8, 0))
+        tk.Label(
+            top_frame, text="Выберите пункты для выполнения",
+            bg=DARK_BG, fg=DARK_FG, font=(APP_FONT, 11, "bold"), anchor="w",
+        ).pack(anchor="w")
 
         # Строка управления: master-чекбокс (белый квадрат) отмечает/снимает
         # все пункты сразу повторным кликом — отдельная кнопка "Снять всё"
         # не нужна, это дублировало бы ту же функцию.
-        master_frame = ttk.Frame(block1)
-        master_frame.pack(fill="x", padx=8, pady=(4, 8))
+        master_frame = tk.Frame(steps_block, bg=DARK_BG)
+        master_frame.pack(fill="x", padx=8, pady=(6, 8))
 
         self.master_var = tk.BooleanVar(value=False)
         self.master_box = tk.Canvas(
@@ -3165,7 +3426,10 @@ class CleanerApp:
         self.master_box.pack(side="left", padx=(2, 8))
         self.master_box.bind("<Button-1>", self._toggle_master)
 
-        master_label = ttk.Label(master_frame, text="Выбрать все пункты", style="Dim.TLabel", cursor="hand2")
+        master_label = tk.Label(
+            master_frame, text="Выбрать все пункты", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 9), cursor="hand2",
+        )
         master_label.pack(side="left")
         master_label.bind("<Button-1>", self._toggle_master)
 
@@ -3182,19 +3446,11 @@ class CleanerApp:
 
         self._draw_master_box()
 
-        # ------------------------------------------------------------------
-        # Блок 2: сами пункты выполнения (чекбокс + название + ~ETA +
-        # кнопка "Выполнить" для каждой строки). Общая рамка вокруг всего
-        # списка — строки внутри разделены линией того же цвета, но
-        # визуально принадлежат одному блоку. Рамка и разделители утолщены
-        # (3px) и осветлены для более чёткого визуального отделения блока
-        # и строк друг от друга.
-        # ------------------------------------------------------------------
-        steps_outer = tk.Frame(scroll_frame, bg=DARK_BLOCK_BORDER, bd=0)
-        steps_outer.pack(fill="x", padx=10, pady=(0, 8))
+        # Разделитель между шапкой блока и самими пунктами.
+        tk.Frame(steps_block, bg=DARK_BLOCK_BORDER, height=2).pack(fill="x")
 
-        steps_frame = tk.Frame(steps_outer, bg=DARK_BG)
-        steps_frame.pack(fill="x", padx=2, pady=2)
+        steps_frame = tk.Frame(steps_block, bg=DARK_BG)
+        steps_frame.pack(fill="x")
 
         # Выбранные для отключения службы из безопасного списка (id ->
         # включена ли галочка в развёрнутой панели). По умолчанию все
@@ -3251,8 +3507,10 @@ class CleanerApp:
         self.cancel_btn.pack(side="left", padx=(6, 0))
         Tooltip(self.cancel_btn, "Останавливает выполнение после завершения текущего шага\n(мягкая отмена — текущий шаг не прерывается на середине).")
 
-        tray_btn = ttk.Button(btns_frame, text="Свернуть", command=lambda: self._minimize_to_tray(auto=False))
-        tray_btn.pack(side="left", padx=(6, 0))
+        # Кнопка "Свернуть" убрана: она дублировала штатную кнопку
+        # сворачивания в заголовке окна и занимала место в ряду
+        # действий. Метод _minimize_to_tray оставлен — он ещё
+        # используется программно.
 
         self.restore_btn = ttk.Button(btns_frame, text="Бэкап", command=self.run_restore)
         self.restore_btn.pack(side="right")
@@ -3269,8 +3527,16 @@ class CleanerApp:
         block4 = tk.Frame(block4_outer, bg=DARK_BG)
         block4.pack(fill="x", padx=2, pady=2)
 
-        progress_frame = ttk.Frame(block4)
-        progress_frame.pack(fill="x", padx=8, pady=(8, 6))
+        # Заголовок блока — как у списка пунктов выше: без него панель
+        # выполнения выглядела безымянным набором элементов.
+        tk.Label(
+            block4, text="Выполнение", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 11, "bold"), anchor="w",
+        ).pack(anchor="w", padx=8, pady=(8, 0))
+        tk.Frame(block4, bg=DARK_BLOCK_BORDER, height=2).pack(fill="x", pady=(6, 0))
+
+        progress_frame = tk.Frame(block4, bg=DARK_BG)
+        progress_frame.pack(fill="x", padx=10, pady=(8, 6))
 
         # Текст статуса и таймер — в одной строке; кнопка "Завершить
         # очистку диска" — в СВОЕЙ отдельной строке ниже (а не справа в
@@ -3281,23 +3547,26 @@ class CleanerApp:
         # переноса — казалось, что она пропала, хотя на деле просто не
         # помещалась. wraplength на статусе + отдельная строка под кнопку
         # гарантируют, что кнопка всегда видна независимо от ширины окна.
-        status_row = ttk.Frame(progress_frame)
+        status_row = tk.Frame(progress_frame, bg=DARK_BG)
         status_row.pack(fill="x")
 
-        self.status_label = ttk.Label(
-            status_row, text="Готово к запуску. 0%", font=(APP_FONT, 9), wraplength=520,
+        self.status_label = tk.Label(
+            status_row, text="Готово к запуску", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 10, "bold"), wraplength=520, anchor="w", justify="left",
         )
         self.status_label.pack(side="left", anchor="w")
 
         # Таймер общего времени выполнения — обновляется раз в секунду,
         # пока идёт выполнение, показывает мин:сек. Отдельно от текста
         # статуса, чтобы не мигать вместе с частой сменой сообщений.
-        self.timer_label = ttk.Label(status_row, text="", style="Dim.TLabel", font=(APP_FONT, 9))
-        self.timer_label.pack(side="left", padx=(10, 0))
+        self.timer_label = tk.Label(
+            status_row, text="", bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 10),
+        )
+        self.timer_label.pack(side="right")
         self.run_start_time = None
         self.timer_after_id = None
 
-        kill_cleanmgr_row = ttk.Frame(progress_frame)
+        kill_cleanmgr_row = tk.Frame(progress_frame, bg=DARK_BG)
         kill_cleanmgr_row.pack(fill="x")
 
         # Кнопка принудительного завершения "Очистки диска" — видна, только
@@ -3313,8 +3582,18 @@ class CleanerApp:
         # видело изменения, сделанные позже из GUI-потока по кнопке.
         self.cleanmgr_stop_flag = {"stop": False}
 
-        self.progress = ttk.Progressbar(progress_frame, orient="horizontal", mode="determinate", maximum=100)
-        self.progress.pack(fill="x", pady=4)
+        # Прогресс рисуем на Canvas, а не ttk.Progressbar: у последнего
+        # в тёмной теме пустой жёлоб выглядел сплошной красной полосой
+        # даже на 0%, и понять, сколько выполнено, было нельзя. Здесь
+        # видно и заполнение, и процент числом внутри полосы.
+        self.progress_canvas = tk.Canvas(
+            progress_frame, height=22, bg=DARK_ENTRY_BG,
+            highlightthickness=1, highlightbackground=DARK_BORDER, bd=0,
+        )
+        self.progress_canvas.pack(fill="x", pady=(6, 4))
+        self._progress_value = 0
+        self.progress_canvas.bind("<Configure>", lambda e: self._draw_progress())
+        self._draw_progress()
 
         # Крупная сводка освобождённого места — появляется только после
         # завершения набора пунктов, если реально что-то удалилось.
@@ -3329,32 +3608,51 @@ class CleanerApp:
         # Журнал (упрощённый): список выбранных пунктов с их статусом
         # выполнения (ожидание / выполняется / готово) — без построчных
         # деталей команд, всё это есть только в сохранённом файле отчёта.
-        log_frame = ttk.Frame(block4)
-        log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        log_frame = tk.Frame(block4, bg=DARK_BG)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        ttk.Label(log_frame, text="Выполняемые пункты:").pack(anchor="w")
+        tk.Label(
+            log_frame, text="Ход выполнения", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 9, "bold"), anchor="w",
+        ).pack(anchor="w", pady=(0, 4))
 
-        text_container = ttk.Frame(log_frame)
+        # Контейнер с рамкой того же цвета, что и рамки блоков — панель
+        # журнала явно очерчена, а не висит на фоне.
+        text_container = tk.Frame(log_frame, bg=DARK_BORDER)
         text_container.pack(fill="both", expand=True)
 
         self.log_text = tk.Text(
-            text_container, wrap="word", height=14, state="disabled",
+            text_container, wrap="word", height=10, state="disabled",
             bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
-            selectbackground=DARK_ACCENT, relief="flat", borderwidth=0,
-            highlightthickness=1, highlightbackground=DARK_BORDER,
-            highlightcolor=DARK_ACCENT, font=(APP_FONT, 9),
+            selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
+            relief="flat", borderwidth=0, highlightthickness=0,
+            font=(APP_FONT, 10), padx=10, pady=8, spacing1=3, spacing3=3,
+            cursor="arrow",
         )
         scrollbar = ttk.Scrollbar(text_container, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
+        scrollbar.pack(side="right", fill="y", padx=(0, 1), pady=1)
 
         self.log_text.tag_configure("pending", foreground=DARK_FG_DIM)
-        self.log_text.tag_configure("running", foreground="#ffffff", font=(APP_FONT, 9, "bold"))
+        self.log_text.tag_configure("running", foreground=DARK_ETA_WARN, font=(APP_FONT, 10, "bold"))
         self.log_text.tag_configure("done", foreground="#7fbf7f")
-        self.log_text.tag_configure("error", foreground="#ff8080")
-        self.log_text.tag_configure("cancelled", foreground=DARK_FG_DIM, font=(APP_FONT, 9, "italic"))
-        self.log_text.tag_configure("summary", foreground=DARK_ACCENT_TEXT, font=(APP_FONT, 9, "bold"))
+        self.log_text.tag_configure("error", foreground="#ff8080", font=(APP_FONT, 10, "bold"))
+        self.log_text.tag_configure("cancelled", foreground=DARK_FG_DIM, font=(APP_FONT, 10, "italic"))
+        self.log_text.tag_configure(
+            "summary", foreground=DARK_FG, font=(APP_FONT, 10, "bold"), spacing1=10)
+        self.log_text.tag_configure("summary_ok", foreground="#7fbf7f",
+                                    font=(APP_FONT, 10, "bold"), spacing1=10)
+        self.log_text.tag_configure("summary_warn", foreground=DARK_ETA_WARN,
+                                    font=(APP_FONT, 10, "bold"), spacing1=10)
+        self.log_text.tag_configure("hint", foreground=DARK_FG_DIM, font=(APP_FONT, 9))
+
+        # Колесо мыши над журналом листает журнал, а не всё окно —
+        # тот же приём, что и у панели диагностики.
+        self._scroll_isolated_widgets = getattr(self, "_scroll_isolated_widgets", [])
+        self._scroll_isolated_widgets.append(self.log_text)
+
+        self._render_steps_panel([], {})
 
         # Футер
         footer_frame = ttk.Frame(scroll_frame)
@@ -3376,6 +3674,43 @@ class CleanerApp:
             self.step_rows[step_id]._draw()
         self._draw_master_box()
 
+    def _set_progress(self, value):
+        """Задаёт процент выполнения (0-100) и перерисовывает полосу."""
+        try:
+            self._progress_value = max(0, min(100, int(value)))
+        except (TypeError, ValueError):
+            self._progress_value = 0
+        self._draw_progress()
+
+    def _draw_progress(self):
+        """
+        Рисует полосу прогресса с числом процентов внутри. Вызывается
+        и при изменении значения, и при изменении ширины окна
+        (<Configure>), поэтому всегда занимает всю доступную ширину.
+        """
+        canvas = self.progress_canvas
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w <= 1:
+            # Виджет ещё не разложен менеджером геометрии — будет
+            # перерисован по событию <Configure>.
+            return
+
+        pct = self._progress_value
+        fill_w = int(w * pct / 100)
+        if fill_w > 0:
+            canvas.create_rectangle(0, 0, fill_w, h, outline="", fill=DARK_ACCENT)
+
+        # Процент пишем по центру; цвет зависит от того, накрыт ли центр
+        # заполненной частью — иначе текст сливался бы с фоном.
+        center_covered = fill_w >= w // 2
+        canvas.create_text(
+            w // 2, h // 2, text=f"{pct}%",
+            fill=DARK_ACCENT_TEXT if center_covered else DARK_FG_DIM,
+            font=(APP_FONT, 9, "bold"),
+        )
+
     def _refresh_disk_usage_label(self):
         """
         Перерисовывает мини-индикатор заполнения диска C (полоска +
@@ -3386,20 +3721,50 @@ class CleanerApp:
         info = get_disk_usage_info("C:\\")
         self.disk_usage_canvas.delete("all")
         if info is None:
-            self.disk_usage_label.configure(text="Диск C: н/д")
+            self.disk_usage_label.configure(text="Диск C: сведения недоступны")
+            self.disk_free_label.configure(text="")
             return
         used_gb, total_gb, percent = info
 
-        w, h = 120, 10
-        self.disk_usage_canvas.create_rectangle(0, 0, w, h, outline=DARK_BORDER, width=1, fill=DARK_ENTRY_BG)
-        fill_w = max(1, int(w * percent / 100))
-        # Заполнение >85% подсвечивается тем же тёплым акцентом, что и
-        # долгие пункты ETA — единая визуальная логика "внимание нужно
-        # сюда", не выдумывая ещё один цвет.
-        bar_color = DARK_ETA_WARN if percent >= 85 else DARK_ACCENT
-        self.disk_usage_canvas.create_rectangle(0, 0, fill_w, h, outline="", fill=bar_color)
+        free_gb = round(total_gb - used_gb, 1)
+        warn = percent >= 85
 
-        self.disk_usage_label.configure(text=f"Диск C: {used_gb} / {total_gb} ГБ ({percent}%)")
+        # Полоса рисуется ДВУМЯ цветами: занятое — красным, свободное —
+        # зелёным. Раньше свободная часть была просто пустым фоном, и на
+        # заполненном диске её было почти не видно. Подписи вынесены
+        # прямо внутрь полосы, каждая над своим сегментом.
+        w, h = 420, 26
+        self.disk_usage_canvas.configure(width=w, height=h)
+        used_w = max(2, int(w * percent / 100))
+
+        self.disk_usage_canvas.create_rectangle(
+            0, 0, w, h, outline="", fill=DARK_DISK_FREE)
+        self.disk_usage_canvas.create_rectangle(
+            0, 0, used_w, h, outline="", fill=DARK_ETA_WARN if warn else DARK_ACCENT)
+        self.disk_usage_canvas.create_rectangle(
+            0, 0, w, h, outline=DARK_BORDER, width=1)
+
+        # Внутри полосы — "занято из всего", справа от полосы только
+        # свободное место. Так на одном экране и абсолютные цифры, и
+        # остаток, и ни одна подпись не повторяет другую.
+        inside_text = f"{used_gb} из {total_gb} ГБ"
+        if used_w > 130:
+            self.disk_usage_canvas.create_text(
+                10, h // 2, anchor="w", text=inside_text,
+                fill=DARK_ACCENT_TEXT, font=(APP_FONT, 9, "bold"))
+        else:
+            # Занятый сегмент слишком узкий для текста — пишем на
+            # свободной части, тёмным по светлому.
+            self.disk_usage_canvas.create_text(
+                used_w + 10, h // 2, anchor="w", text=inside_text,
+                fill="#eaf5ee", font=(APP_FONT, 9, "bold"))
+
+        self.disk_usage_label.configure(
+            text=f"Диск C:   {percent}% занято"
+        )
+        self.disk_free_label.configure(text=f"свободно {free_gb} ГБ")
+        self.disk_usage_label.configure(fg=DARK_ETA_WARN if warn else DARK_FG)
+        self.disk_free_label.configure(fg=DARK_DISK_FREE if not warn else DARK_FG)
 
     def _flash_disk_usage_row(self):
         """
@@ -3408,10 +3773,9 @@ class CleanerApp:
         уже открывшегося окна проводника, которое может появиться не
         мгновенно или свернуться за окно программы.
         """
-        self.disk_usage_row.configure(highlightbackground=DARK_ACCENT, highlightthickness=2)
-        self.root.after(200, lambda: self.disk_usage_row.configure(
-            highlightbackground=DARK_BORDER, highlightthickness=1,
-        ))
+        outer = self.disk_usage_row.master
+        outer.configure(bg=DARK_ETA_WARN)
+        self.root.after(200, lambda: outer.configure(bg=DARK_BLOCK_BORDER))
 
     def _open_startup_folders(self):
         """
@@ -3451,20 +3815,30 @@ class CleanerApp:
         системе" — теперь видно сразу, без запуска очистки.
         """
         summary = get_quick_system_summary()
-        text = (
-            f"🖥 {summary['os']} (сборка {summary['build']})   ·   ⚙ {summary['cpu']}   ·   "
-            f"🧠 {summary['ram']}   ·   🔧 {summary['board']}"
-        )
-        self.root.after(0, lambda: self._set_system_summary_text(text))
+        self.root.after(0, lambda: self._set_system_summary_fields(summary))
 
-    def _set_system_summary_text(self, text):
+    # Подписи полей сводки — один список на отображение и на копирование,
+    # чтобы порядок и названия не разъезжались между ними.
+    SYSINFO_FIELDS = (
+        ("os", "ОС"), ("build", "Сборка"), ("cpu", "Процессор"),
+        ("ram", "Память"), ("board", "Плата"),
+    )
+
+    def _set_system_summary_fields(self, summary):
         """
-        Заменяет текст в поле сводки. Поле только для чтения за счёт
-        перехвата клавиш, а не state="disabled", поэтому вставлять текст
-        можно напрямую, без временного разблокирования.
+        Раскладывает сводку по отдельным строкам-полям. Раньше всё
+        сводилось в одну текстовую строку, и границы между значениями
+        приходилось угадывать.
         """
-        self.system_summary_text.delete("1.0", "end")
-        self.system_summary_text.insert("1.0", text)
+        self._system_summary = dict(summary)
+        self.sysinfo_text.delete("1.0", "end")
+        for idx, (key, caption) in enumerate(self.SYSINFO_FIELDS):
+            value = summary.get(key, "?") or "?"
+            self.sysinfo_text.insert("end", caption, "caption")
+            self.sysinfo_text.insert("end", "\t")
+            self.sysinfo_text.insert("end", value, "value")
+            if idx < len(self.SYSINFO_FIELDS) - 1:
+                self.sysinfo_text.insert("end", "\n")
 
     def _load_hardware_diagnostics_async(self):
         """
@@ -3492,24 +3866,51 @@ class CleanerApp:
             word = "проблема" if len(problems) == 1 else (
                 "проблемы" if 2 <= len(problems) <= 4 else "проблем")
             self.diag_status_label.configure(
-                text=f"🩺 Диагностика железа: {len(problems)} {word} — требует внимания",
+                text=f"🩺  Диагностика железа: {len(problems)} {word} — требует внимания",
                 fg=DARK_ETA_WARN,
             )
         else:
             self.diag_status_label.configure(
-                text="🩺 Диагностика железа: проблем не обнаружено", fg=DARK_FG_DIM,
+                text="🩺  Диагностика железа: проблем не обнаружено", fg=DARK_FG,
             )
 
         self.diag_details_text.delete("1.0", "end")
         self.diag_details_text.insert("1.0", text)
-        # Подгоняем высоту под содержимое, чтобы блок показывался
-        # целиком и не приходилось его листать. Потолок 20 строк — на
-        # случай, если устройств с ошибками окажется необычно много.
-        line_count = text.count("\n") + 1
-        self.diag_details_text.configure(height=min(max(line_count, 4), 20))
-        self.diag_toggle_btn.pack(side="left", padx=(8, 0))
-        self.copy_diag_btn.pack(side="right", padx=(6, 0))
+
+        # Помечаем заголовки разделов и строки проблем тегами — они
+        # заданы при создании виджета и красят текст без разметки в
+        # самой строке.
+        for idx, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("─") and stripped.endswith("─"):
+                self.diag_details_text.tag_add("section", f"{idx}.0", f"{idx}.end")
+            elif stripped.startswith("!"):
+                self.diag_details_text.tag_add("problem", f"{idx}.0", f"{idx}.end")
+
+        self.diag_toggle_btn.pack(side="right")
         self._draw_diag_toggle()
+
+    def _copy_text_selection(self, widget, fallback):
+        """
+        Копирует выделенное в переданном Text-виджете. Если ничего не
+        выделено — вызывает fallback (копирование блока целиком), чтобы
+        пункт меню никогда не срабатывал вхолостую.
+        """
+        try:
+            text = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            fallback()
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
+
+    def _copy_diag_selection(self):
+        self._copy_text_selection(self.diag_details_text, self._copy_diagnostics)
 
     def _copy_diagnostics(self):
         """
@@ -3529,26 +3930,51 @@ class CleanerApp:
         self.root.after(1200, lambda: self.copy_diag_btn.configure(text="Копировать"))
 
     def _draw_diag_toggle(self):
+        # Развёрнуто — тёплый акцент (как у раскрытой панели служб),
+        # свёрнуто — основной красный акцент: в обоих состояниях кнопка
+        # выглядит кнопкой, а не подписью.
         if self._diag_expanded:
-            self.diag_toggle_btn.configure(text="▾ Подробнее", bg=DARK_ETA_WARN, fg="#1a1a1a")
+            self.diag_toggle_btn.configure(text="▾  Свернуть", bg=DARK_ETA_WARN, fg="#1a1a1a")
         else:
-            self.diag_toggle_btn.configure(text="▸ Подробнее", bg=DARK_BG, fg=DARK_FG_DIM)
+            self.diag_toggle_btn.configure(text="▸  Подробнее", bg=DARK_ACCENT, fg=DARK_ACCENT_TEXT)
 
     def _toggle_diag_details(self):
         self._diag_expanded = not self._diag_expanded
         if self._diag_expanded:
-            self.diag_details_frame.pack(fill="x", padx=8, pady=(0, 6))
+            self.diag_sep.pack(fill="x")
+            self.diag_details_frame.pack(fill="x", pady=(0, 6))
         else:
             self.diag_details_frame.pack_forget()
+            self.diag_sep.pack_forget()
         self._draw_diag_toggle()
+
+    def _toggle_sysinfo(self, _event=None):
+        """
+        Сворачивает/разворачивает блок "Система". Развёрнут по
+        умолчанию — характеристики машины обычно и нужны сразу, но на
+        маленьком экране блок можно убрать, чтобы не листать до списка
+        пунктов.
+        """
+        self._sysinfo_expanded = not self._sysinfo_expanded
+        if self._sysinfo_expanded:
+            self.sysinfo_body.pack(fill="x")
+            self.sysinfo_toggle_btn.configure(text="▾")
+        else:
+            self.sysinfo_body.pack_forget()
+            self.sysinfo_toggle_btn.configure(text="▸")
 
     def _copy_system_summary(self):
         """
         Кладёт сводку о системе в буфер обмена целиком — быстрее, чем
-        выделять мышью, когда нужно просто переслать характеристики.
+        выделять по строке, когда нужно просто переслать характеристики.
         """
-        text = self.system_summary_text.get("1.0", "end-1c").strip()
-        if not text:
+        summary = getattr(self, "_system_summary", None)
+        if not summary:
+            return
+        text = "\n".join(
+            f"{caption}: {summary.get(key, '?')}" for key, caption in self.SYSINFO_FIELDS
+        )
+        if not text.strip():
             return
         try:
             self.root.clipboard_clear()
@@ -3675,11 +4101,18 @@ class CleanerApp:
         """
         self._about_expanded = not self._about_expanded
         if self._about_expanded:
-            self.about_toggle_btn.configure(text="▾ ⓘ О программе")
-            self.about_frame.pack(fill="x", after=self.about_toggle_row)
+            # Разворачивается сразу под строкой с названием и кнопкой —
+            # там, где на кнопку и нажали.
+            self.about_frame.pack(fill="x", padx=8, pady=(4, 2), after=self.header_frame)
         else:
-            self.about_toggle_btn.configure(text="▸ ⓘ О программе")
             self.about_frame.pack_forget()
+        self._draw_about_toggle()
+
+    def _draw_about_toggle(self):
+        if self._about_expanded:
+            self.about_toggle_btn.configure(bg=DARK_ETA_WARN, fg="#1a1a1a")
+        else:
+            self.about_toggle_btn.configure(bg=DARK_BG, fg=DARK_FG_DIM)
 
     def _toggle_master(self, _event=None):
         # Клик по мастер-чекбоксу: если что-то выбрано — снимает всё,
@@ -3718,16 +4151,50 @@ class CleanerApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
 
-        icons = {"pending": "○", "running": "▶", "done": "✓", "error": "✗", "cancelled": "–"}
+        if not steps_to_run:
+            # До первого запуска панель не должна выглядеть сломанной
+            # пустой рамкой — пишем, что делать.
+            self.log_text.insert(
+                "end",
+                "Отметьте пункты выше и нажмите «Выполнить всё отмеченное».\n"
+                "Здесь будет виден ход выполнения.",
+                "hint",
+            )
+            self.log_text.configure(state="disabled")
+            return
+
+        icons = {"pending": "○", "running": "▶", "done": "✓", "error": "✗", "cancelled": "—"}
+        labels = {
+            "pending": "ожидает",
+            "running": "выполняется",
+            "done": "готово",
+            "error": "ошибка",
+            "cancelled": "отменено",
+        }
         for step_id, title, *_rest in steps_to_run:
             state = statuses.get(step_id, "pending")
             icon = icons.get(state, "○")
-            self.log_text.insert("end", f"{icon}  {title}\n", state)
+            # Статус словом рядом с названием: по одному значку не всегда
+            # понятно, ждёт пункт очереди или уже отменён.
+            self.log_text.insert("end", f"{icon}  {title}", state)
+            self.log_text.insert("end", f"   — {labels.get(state, state)}\n", state)
 
         if summary:
-            self.log_text.insert("end", "\n" + summary + "\n", "summary")
+            # Цвет итога зависит от результата: зелёный, если всё
+            # прошло, красный — если были ошибки или отмена.
+            low = summary.lower()
+            if "ошибк" in low or "отмен" in low:
+                tag = "summary_warn"
+            elif "успешно" in low or "готово" in low:
+                tag = "summary_ok"
+            else:
+                tag = "summary"
+            self.log_text.insert("end", summary + "\n", tag)
 
         self.log_text.configure(state="disabled")
+        # Прокручиваем к последней строке — при длинном списке важен
+        # хвост (текущий пункт и итог), а не начало.
+        self.log_text.see("end")
 
     def _check_update_background(self, silent):
         """
@@ -3994,7 +4461,10 @@ class CleanerApp:
             return
 
         self.cancel_requested = False
-        self.progress.configure(maximum=100, value=0)
+        self._set_progress(0)
+        # Сбрасываем цвет статуса — после прошлого запуска он мог
+        # остаться зелёным или красным.
+        self.status_label.configure(fg=DARK_FG)
         self.open_report_btn.configure(state="disabled")
         self.restore_btn.configure(state="disabled")
         self.cancel_btn.configure(state=("normal" if len(steps_to_run) > 1 else "disabled"))
@@ -4393,13 +4863,17 @@ class CleanerApp:
                 elif kind == "status":
                     self.status_label.configure(text=payload)
                 elif kind == "progress":
-                    self.progress.configure(value=payload)
+                    self._set_progress(payload)
                 elif kind == "done":
                     report_path, cancelled, freed_gb = payload
                     self.report_path = report_path
-                    self.status_label.configure(text="Отменено." if cancelled else "Готово. 100%")
-                    if not cancelled:
-                        self.progress.configure(value=100)
+                    # Статус после завершения — цветом по результату:
+                    # раньше и успех, и отмена были одинаково белыми.
+                    if cancelled:
+                        self.status_label.configure(text="Выполнение отменено", fg=DARK_ETA_WARN)
+                    else:
+                        self.status_label.configure(text="Выполнение завершено", fg="#7fbf7f")
+                        self._set_progress(100)
                     self._refresh_disk_usage_label()
 
                     # Крупная сводка освобождённого места. Величина —
