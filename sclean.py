@@ -22,7 +22,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.25.0"
+APP_VERSION = "1.25.1"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -5370,6 +5370,21 @@ class CleanerApp:
             else:
                 other_steps.append(step)
 
+        # Единый счётчик прогресса на весь набор: и последовательные
+        # пункты, и фоновые (cleanmgr) увеличивают его на единицу.
+        # Раньше у них были разные знаменатели, из-за чего полоса
+        # доходила до 100% ещё во время работы фоновой очистки.
+        total_units = len(other_steps) + len(cleanmgr_entries)
+        done_units = 0
+        done_units_lock = threading.Lock()
+
+        def _bump_progress():
+            nonlocal done_units
+            with done_units_lock:
+                done_units += 1
+                pct = int(round(done_units / total_units * 100)) if total_units else 100
+            self.msg_queue.put(("progress", pct))
+
         cleanmgr_thread = None
         if cleanmgr_entries:
             first_title = cleanmgr_entries[0][1]
@@ -5393,6 +5408,9 @@ class CleanerApp:
                         self.msg_queue.put(("step_status", (c_id, "cancelled")))
                         with step_results_lock:
                             step_results.append((c_title, "cancelled", step_details.get(c_id, [])))
+                        # Отменённый пункт тоже закрывает свою долю
+                        # прогресса — иначе полоса застрянет не на 100%.
+                        _bump_progress()
                         continue
 
                     self.msg_queue.put(("step_status", (c_id, "running")))
@@ -5412,11 +5430,15 @@ class CleanerApp:
                         with step_results_lock:
                             step_results.append((c_title, "error", step_details.get(c_id, [])))
                         self.msg_queue.put(("step_status", (c_id, "error")))
+                    finally:
+                        # Пункт завершён (успешно, с ошибкой или отменой)
+                        # — двигаем общий прогресс.
+                        _bump_progress()
 
+            cleanmgr_started_at = time.time()
             cleanmgr_thread = threading.Thread(target=_run_cleanmgr_async, daemon=True)
             cleanmgr_thread.start()
 
-        total_other = len(other_steps)
         for idx, (step_id, title, func, returns_text, *_rest) in enumerate(other_steps, start=1):
             if self.cancel_requested:
                 cancelled = True
@@ -5426,7 +5448,12 @@ class CleanerApp:
                 break
 
             self.msg_queue.put(("step_status", (step_id, "running")))
-            pct_before = int(round((idx - 1) / total_other * 100)) if total_other else 0
+            # Прогресс считается по ВСЕМ пунктам набора, включая те, что
+            # идут в фоне (cleanmgr). Раньше знаменателем были только
+            # последовательные пункты, и полоса показывала 100%, пока
+            # фоновая очистка диска ещё работала.
+            with done_units_lock:
+                pct_before = int(round(done_units / total_units * 100)) if total_units else 0
             eta = STEP_ESTIMATED_SEC.get(step_id)
             eta_txt = f"  (ожидается {format_eta(eta)})" if eta else ""
             self.msg_queue.put(("status", f"Выполняется: {title}  —  {pct_before}%{eta_txt}"))
@@ -5451,18 +5478,21 @@ class CleanerApp:
                     failures.append((title, str(e)))
                 step_results.append((title, "error", step_details.get(step_id, [])))
                 self.msg_queue.put(("step_status", (step_id, "error")))
-            pct_after = int(round(idx / total_other * 100)) if total_other else 100
-            self.msg_queue.put(("progress", pct_after))
+            _bump_progress()
 
         if cleanmgr_thread is not None:
             # Периодически обновляем статус с прошедшим временем ожидания,
             # вместо одного статичного сообщения на весь период join() —
             # так по интерфейсу видно, что программа не зависла, а реально
             # ждёт, пока пользователь закроет окно очистки диска.
-            wait_start = time.time()
+            # Отсчёт ведём от МОМЕНТА ЗАПУСКА cleanmgr, а не от начала
+            # ожидания: очистка стартовала вместе с остальными пунктами
+            # и к этому моменту уже работала. Раньше счётчик начинался
+            # заново и первые секунды показывал "~0 сек", хотя фоновая
+            # задача шла уже полминуты.
             limit_txt = format_eta(int(CLEANMGR_MAX_SECONDS))
             while cleanmgr_thread.is_alive():
-                waited = int(time.time() - wait_start)
+                waited = int(time.time() - cleanmgr_started_at)
                 self.msg_queue.put((
                     "status",
                     f"Очистка диска работает в фоне ({format_eta(waited)}, предел {limit_txt} на пункт) — "
