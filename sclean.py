@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.21.0"
+APP_VERSION = "1.22.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -2585,6 +2585,12 @@ DARK_ETA_WARN = "#e05260"
 # сколько занято, но и сколько осталось.
 DARK_DISK_FREE = "#3f8f5f"
 
+# Предел ширины содержимого. Окно можно растянуть на любой монитор, но
+# сами блоки шире этого значения не становятся и центрируются: иначе на
+# широком экране кнопки "Выполнить" уезжают к правому краю, а между
+# названием пункта и временем выполнения зияет пустота.
+CONTENT_MAX_WIDTH = 1100
+
 # Псевдообъём. Настоящих теней и скруглений в tkinter нет (у виджетов
 # нет альфа-канала и border-radius), поэтому объём имитируется двумя
 # однопиксельными полосами: тёмная под блоком читается как тень, а
@@ -2972,9 +2978,17 @@ class CleanerApp:
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
         def _sync_scroll_frame_width(event):
-            # Внутренний frame должен всегда иметь ширину canvas, иначе
-            # содержимое "плавает" при изменении размера окна.
-            self.canvas.itemconfigure(self._scroll_frame_window, width=event.width)
+            # Ширина содержимого ограничена CONTENT_MAX_WIDTH и
+            # центрируется. Без ограничения на широком мониторе строки
+            # пунктов растягивались на всю ширину: кнопки "Выполнить"
+            # уезжали к правому краю, а между названием пункта и
+            # временем оставалась полоса пустоты в пол-экрана.
+            # На моноблоках (1366 px и уже) ограничение не срабатывает —
+            # там содержимое по-прежнему занимает всю ширину.
+            width = min(event.width, CONTENT_MAX_WIDTH)
+            x = max(0, (event.width - width) // 2)
+            self.canvas.itemconfigure(self._scroll_frame_window, width=width)
+            self.canvas.coords(self._scroll_frame_window, x, 0)
 
         scroll_frame.bind("<Configure>", _update_scrollregion)
         self.canvas.bind("<Configure>", _sync_scroll_frame_width)
@@ -3516,7 +3530,16 @@ class CleanerApp:
             "15 минут и более, их отмечают вручную, когда есть время.",
         )
 
+        # Сводка по отмеченному: сколько пунктов и сколько это займёт.
+        # Раньше оценить время можно было только сложив ETA всех
+        # отмеченных строк в уме.
+        self.selection_summary_label = tk.Label(
+            master_frame, text="", bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 9),
+        )
+        self.selection_summary_label.pack(side="right", padx=(0, 12))
+
         self._draw_master_box()
+        self._update_selection_summary()
 
         # Разделитель между шапкой блока и самими пунктами.
         tk.Frame(steps_block, bg=DARK_BLOCK_BORDER, height=2).pack(fill="x")
@@ -4273,6 +4296,31 @@ class CleanerApp:
         # Вызывается при изменении любого отдельного чекбокса, чтобы
         # мастер-чекбокс отражал состояние "всё выбрано" / "не всё".
         self._draw_master_box()
+        self._update_selection_summary()
+
+    def _update_selection_summary(self):
+        """
+        Показывает, сколько пунктов отмечено и сколько времени они
+        займут суммарно. ETA у пунктов уже есть по отдельности, но
+        сложить их в уме — лишняя работа, особенно когда среди
+        отмеченного попадаются два пункта по 15 минут.
+        """
+        if not hasattr(self, "selection_summary_label"):
+            return
+        selected = [sid for sid, var in self.check_vars.items() if var.get()]
+        if not selected:
+            self.selection_summary_label.configure(text="ничего не отмечено", fg=DARK_FG_DIM)
+            return
+
+        total_sec = sum(STEP_ESTIMATED_SEC.get(sid) or 0 for sid in selected)
+        word = "пункт" if len(selected) == 1 else (
+            "пункта" if 2 <= len(selected) <= 4 else "пунктов")
+        text = f"отмечено {len(selected)} {word}  ·  ~{format_eta(total_sec)}"
+        # Длинные наборы (от 5 минут) подсвечиваем тем же акцентом, что
+        # и долгие пункты по отдельности.
+        self.selection_summary_label.configure(
+            text=text, fg=DARK_ETA_WARN if total_sec >= 300 else DARK_FG,
+        )
 
     def _draw_master_box(self):
         if not hasattr(self, "master_box"):
