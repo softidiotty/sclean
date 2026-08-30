@@ -8,6 +8,10 @@ import datetime
 import threading
 import queue
 import webbrowser
+# ctypes нужен и для запроса прав администратора, и для иконки в
+# панели задач (AppUserModelID + WM_SETICON) — импортируем на уровне
+# модуля, а не внутри отдельных функций.
+import ctypes
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -18,7 +22,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.22.0"
+APP_VERSION = "1.25.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -2054,6 +2058,134 @@ def collect_hardware_diagnostics(logf=None):
     return "\n".join(lines), problems
 
 
+def collect_event_log_summary(days=30, logf=None):
+    """
+    Собирает историю сбоев за последние `days` дней: некорректные
+    выключения, синие экраны, падения приложений и перезагрузки.
+
+    Отвечает на вопрос "что случилось с терминалом за месяц" — в
+    отличие от диагностики железа, которая показывает состояние
+    "прямо сейчас". Поэтому собирается по кнопке, а не при запуске.
+
+    Используется Get-WinEvent -FilterHashtable: фильтрация идёт на
+    стороне журнала событий, а не в PowerShell, поэтому запрос
+    укладывается в пару секунд. Через Get-EventLog или Where-Object
+    после выгрузки всего журнала это заняло бы десятки секунд.
+
+    Возвращает (text, problems).
+    """
+    if logf is None:
+        def logf(_msg):
+            pass
+
+    logf(f"Сбор журнала событий за {days} дней...")
+    lines = []
+    problems = []
+
+    # Ключевые события. Id 41 — питание пропало без корректного
+    # завершения, 6008 — предыдущее выключение было неожиданным,
+    # 1001 — записан дамп после синего экрана, 6005/6006 — старт и
+    # штатная остановка журнала (то есть включение/выключение).
+    ps = (
+        f"$since = (Get-Date).AddDays(-{days}); "
+        "$out = @(); "
+        "function Add-Ev($label, $log, $ids) { "
+        "  try { "
+        "    $evs = @(Get-WinEvent -FilterHashtable @{LogName=$log; ID=$ids; StartTime=$since} -ErrorAction Stop); "
+        "    $script:out += ($label + '|' + $evs.Count + '|' + "
+        "      $(if ($evs.Count -gt 0) { $evs[0].TimeCreated.ToString('dd.MM.yyyy HH:mm') } else { '' })) "
+        "  } catch { $script:out += ($label + '|0|') } "
+        "}; "
+        "Add-Ev 'kernel_power' 'System' @(41); "
+        "Add-Ev 'unexpected' 'System' @(6008); "
+        "Add-Ev 'bugcheck' 'System' @(1001); "
+        "Add-Ev 'boot' 'System' @(6005); "
+        "Add-Ev 'appcrash' 'Application' @(1000); "
+        "Add-Ev 'apphang' 'Application' @(1002); "
+        "$out -join [Environment]::NewLine"
+    )
+    out = run_ps(ps, timeout=120)
+
+    stats = {}
+    for line in (out or "").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) >= 2 and parts[0].strip():
+            try:
+                stats[parts[0].strip()] = (int(parts[1]), parts[2].strip() if len(parts) > 2 else "")
+            except ValueError:
+                continue
+
+    if not stats:
+        return "Не удалось прочитать журнал событий Windows.", []
+
+    def cnt(key):
+        return stats.get(key, (0, ""))[0]
+
+    def last(key):
+        return stats.get(key, (0, ""))[1]
+
+    lines.append(f"─ Сбои за {days} дней ─")
+    rows = (
+        ("kernel_power", "Отключение питания без завершения работы"),
+        ("unexpected", "Неожиданное выключение"),
+        ("bugcheck", "Синий экран (BSOD)"),
+        ("appcrash", "Падения приложений"),
+        ("apphang", "Зависания приложений"),
+    )
+    for key, label in rows:
+        n = cnt(key)
+        if n:
+            suffix = f", последний раз {last(key)}" if last(key) else ""
+            lines.append(f"  {label}: {n}{suffix}")
+        else:
+            lines.append(f"  {label}: нет")
+        logf(f"  {label}: {n}")
+
+    lines.append("")
+    lines.append("─ Перезагрузки ─")
+    boots = cnt("boot")
+    lines.append(f"  Запусков системы за период: {boots}")
+    if last("boot"):
+        lines.append(f"  Последний запуск: {last('boot')}")
+    logf(f"  Запусков системы: {boots}")
+
+    # Оценки. Пороги подобраны под кассу, которая работает ежедневно:
+    # одно-два некорректных выключения за месяц — обычное дело
+    # (выдернули питание в конце смены), а вот пять и больше означает
+    # проблему с электропитанием или блоком питания.
+    hard_off = cnt("kernel_power") + cnt("unexpected")
+    if hard_off >= 5:
+        problems.append(
+            f"некорректных выключений за {days} дней: {hard_off} — проверьте питание, "
+            "ИБП и настройки завершения работы"
+        )
+    if cnt("bugcheck"):
+        problems.append(
+            f"синих экранов за {days} дней: {cnt('bugcheck')} — вероятны проблемы "
+            "с драйверами или оперативной памятью"
+        )
+    if cnt("appcrash") >= 20:
+        problems.append(
+            f"падений приложений за {days} дней: {cnt('appcrash')} — стоит посмотреть, "
+            "что именно падает, в просмотре событий"
+        )
+    if boots >= days * 2:
+        problems.append(
+            f"система перезагружалась {boots} раз за {days} дней — необычно часто "
+            "для терминала, который должен работать непрерывно"
+        )
+
+    lines.append("")
+    if problems:
+        lines.append("─ Требует внимания ─")
+        for p in problems:
+            lines.append(f"  ! {p}")
+    else:
+        lines.append("Отклонений не обнаружено.")
+
+    return "\n".join(lines), problems
+
+
 def _find_speedtest_cli():
     """
     Ищет speedtest.exe (официальный Ookla Speedtest CLI) — сначала рядом
@@ -2585,6 +2717,21 @@ DARK_ETA_WARN = "#e05260"
 # сколько занято, но и сколько осталось.
 DARK_DISK_FREE = "#3f8f5f"
 
+# Фон отмеченной строки в списке пунктов и цвет её маркера слева.
+# Раньше отмеченная строка заливалась сплошным DARK_ACCENT — при
+# 13 отмеченных пунктах список превращался в красную стену, где
+# отдельные строки не читались. Теперь фон лишь немного светлее
+# обычного, а принадлежность к выбранным показывает яркая полоска.
+DARK_ROW_SELECTED = "#2f2226"
+DARK_ACCENT_BRIGHT = "#c0392b"
+
+# Фон предупреждающей плашки о нехватке места. Ярко-красная заливка
+# (DARK_ACCENT_BRIGHT) выбивалась из общей тёмной гаммы и перетягивала
+# внимание с самих данных — здесь приглушённый тёмно-красный, а роль
+# акцента играют значок и полоска слева.
+DARK_WARN_BG = "#3a2327"
+DARK_WARN_FG = "#e8a0a0"
+
 # Предел ширины содержимого. Окно можно растянуть на любой монитор, но
 # сами блоки шире этого значения не становятся и центрируются: иначе на
 # широком экране кнопки "Выполнить" уезжают к правому краю, а между
@@ -2605,6 +2752,7 @@ BLOCK_ACCENTS = {
     "disk": "#c0392b",
     "system": "#3f7fa8",
     "diag": "#8f6fb0",
+    "evlog": "#b08a4a",
     "steps": "#7a1620",
     "actions": "#6a6a70",
     "run": "#3f8f5f",
@@ -2738,6 +2886,14 @@ class StepRow(tk.Frame):
         self.on_toggle_callback = None
         self.eta_sec = eta_sec
 
+        # Полоска-маркер слева: у отмеченной строки она красная, у
+        # неотмеченной — цвета фона (то есть невидима). Вместе с
+        # приглушённым фоном это заменило сплошную яркую заливку —
+        # когда отмечали все 13 пунктов, список превращался в красную
+        # стену, в которой не читались отдельные строки.
+        self.mark_stripe = tk.Frame(self, bg=DARK_BG, width=3)
+        self.mark_stripe.pack(side="left", fill="y")
+
         self.box_canvas = tk.Canvas(
             self, width=20, height=20, bg=DARK_BG, highlightthickness=0, bd=0
         )
@@ -2832,10 +2988,14 @@ class StepRow(tk.Frame):
 
     def _draw(self):
         checked = self.variable.get()
-        row_bg = DARK_ACCENT if checked else DARK_BG
-        text_fg = DARK_ACCENT_TEXT if checked else DARK_FG
+        # Отмеченная строка: приглушённый тёмный фон + красная полоска
+        # слева, а не сплошная яркая заливка. Так строки остаются
+        # читаемыми даже когда отмечены все пункты сразу.
+        row_bg = DARK_ROW_SELECTED if checked else DARK_BG
+        text_fg = DARK_FG if checked else DARK_FG
 
         self.configure(bg=row_bg)
+        self.mark_stripe.configure(bg=DARK_ACCENT_BRIGHT if checked else row_bg)
         self.box_canvas.configure(bg=row_bg)
         self.label.configure(bg=row_bg, fg=text_fg)
         if self.eta_label is not None:
@@ -2845,11 +3005,11 @@ class StepRow(tk.Frame):
             # выбранном) фоне — на красном фоне выбранной строки желтизна
             # плохо читается и конфликтует с акцентом выбора, там
             # оставляем обычный светлый текст.
+            # Фон отмеченной строки теперь тёмный, поэтому тёплый акцент
+            # на нём читается — отдельная ветка для checked больше не
+            # нужна, долгие пункты подсвечиваются в любом состоянии.
             is_long = (self.eta_sec or 0) >= 60
-            if is_long and not checked:
-                eta_fg = DARK_ETA_WARN
-            else:
-                eta_fg = DARK_ACCENT_TEXT if checked else DARK_FG_DIM
+            eta_fg = DARK_ETA_WARN if is_long else DARK_FG_DIM
             self.eta_label.configure(bg=row_bg, fg=eta_fg)
         if self.expand_btn is not None:
             # Собственная подсветка: когда панель "Подробнее" раскрыта,
@@ -2859,7 +3019,7 @@ class StepRow(tk.Frame):
             if self.expanded:
                 self.expand_btn.configure(bg=DARK_ETA_WARN, fg="#1a1a1a")
             else:
-                self.expand_btn.configure(bg=row_bg, fg=(DARK_ACCENT_TEXT if checked else DARK_FG_DIM))
+                self.expand_btn.configure(bg=row_bg, fg=DARK_FG_DIM)
 
         self.box_canvas.delete("all")
         # Квадрат в том же стиле, что и мастер-чекбокс: всегда белый с
@@ -2893,6 +3053,11 @@ class CleanerApp:
         self.worker_thread = None
         self.check_vars = {}
         self.step_rows = {}
+        # Для фильтра по строке поиска: разделители прячутся вместе со
+        # своими строками, а текст для поиска собирается из названия и
+        # описания пункта.
+        self._step_separators = {}
+        self._step_search_text = {}
         self.log_lines = []
         self.current_steps = []
         self.current_statuses = {}
@@ -2908,10 +3073,55 @@ class CleanerApp:
         threading.Thread(target=self._check_update_background, args=(True,), daemon=True).start()
 
     def _set_window_icon(self):
+        """
+        Ставит иконку окна и — отдельно — иконку в панели задач.
+
+        Одного iconbitmap() недостаточно: панель задач Windows
+        группирует окна по AppUserModelID, и если процесс его не задал,
+        система подбирает иконку сама. Для программы, запущенной из
+        exe с повышением прав, она нередко подставляет иконку чужого
+        приложения — в панели вместо нашего логотипа появлялось перо
+        постороннего процесса.
+
+        SetCurrentProcessExplicitAppUserModelID должен вызываться до
+        создания окон, но в Tk окно уже существует — на практике
+        достаточно вызвать его здесь, до первого показа окна, и панель
+        задач подхватывает правильную иконку.
+        """
+        ico_path = resource_path("sclean.ico")
+
+        # 1. Собственный AppUserModelID — чтобы Windows не приписывала
+        # окно к чужому приложению.
         try:
-            ico_path = resource_path("sclean.ico")
+            app_id = f"softidiotty.{APP_NAME}.{APP_VERSION}"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+
+        # 2. Иконка окна (заголовок + Alt+Tab).
+        try:
             if os.path.isfile(ico_path):
+                self.root.iconbitmap(default=ico_path)
+        except Exception:
+            try:
                 self.root.iconbitmap(ico_path)
+            except Exception:
+                pass
+
+        # 3. Иконка процесса через WM_SETICON — именно её панель задач
+        # показывает для окна. iconbitmap() влияет на окно Tk, но не
+        # всегда доходит до панели.
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                hwnd = self.root.winfo_id()
+            # LoadImageW: IMAGE_ICON=1, LR_LOADFROMFILE=0x10.
+            for size, wparam in ((16, 0), (32, 1)):  # ICON_SMALL=0, ICON_BIG=1
+                handle = ctypes.windll.user32.LoadImageW(
+                    None, ico_path, 1, size, size, 0x10,
+                )
+                if handle:
+                    ctypes.windll.user32.SendMessageW(hwnd, 0x0080, wparam, handle)
         except Exception:
             pass
 
@@ -3196,6 +3406,25 @@ class CleanerApp:
         )
         self.disk_usage_hint.pack(side="right")
 
+        # Баннер критично малого места — появляется от 90% заполнения.
+        # Не .pack() здесь: показывается из _update_low_space_banner().
+        # Приглушённый фон + акцентная полоска слева — та же логика, что
+        # у блоков и отмеченных строк: внимание привлекает акцент, а не
+        # заливка во весь баннер.
+        self.low_space_banner = tk.Frame(disk_usage_inner, bg=DARK_WARN_BG)
+        tk.Frame(self.low_space_banner, bg=DARK_ACCENT_BRIGHT, width=3).pack(side="left", fill="y")
+        low_inner = tk.Frame(self.low_space_banner, bg=DARK_WARN_BG)
+        low_inner.pack(side="left", fill="x", expand=True, padx=10, pady=6)
+        self.low_space_label = tk.Label(
+            low_inner, text="", bg=DARK_WARN_BG, fg=DARK_WARN_FG,
+            font=(APP_FONT, 9), anchor="w", justify="left",
+        )
+        self.low_space_label.pack(side="left")
+        self.low_space_btn = ttk.Button(
+            low_inner, text="Очистить сейчас", width=18, command=self._run_cleanup_only,
+        )
+        self.low_space_btn.pack(side="right")
+
         disk_bar_row = tk.Frame(disk_usage_inner, bg=DARK_BG)
         disk_bar_row.pack(fill="x", pady=(4, 0))
         self.disk_usage_canvas = tk.Canvas(
@@ -3285,11 +3514,9 @@ class CleanerApp:
         )
         self.sysinfo_title.pack(side="left", padx=(6, 0))
 
-        # Подсказки при наведении на кнопках "Копировать" нет: надпись
-        # и так говорит, что делает кнопка, а всплывающее окно только
-        # перекрывало соседние строки.
-        self.copy_summary_btn = ttk.Button(
-            sysinfo_head, text="Копировать", width=12, command=self._copy_system_summary,
+        self.copy_summary_btn = self._make_copy_icon(
+            sysinfo_head, self._copy_system_summary,
+            "Скопировать сведения о системе\n(или выделите нужное мышью и нажмите Ctrl+C)",
         )
         self.copy_summary_btn.pack(side="right")
 
@@ -3332,38 +3559,7 @@ class CleanerApp:
         # подписи — так же ровно, как это делал grid.
         self.sysinfo_text.configure(tabs=("95p",))
 
-        def _summary_keypress(event):
-            # Пропускаем только копирование и выделение всего текста,
-            # остальные нажатия игнорируем — получается поле, доступное
-            # только для чтения, но с рабочим выделением.
-            if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
-                return None
-            if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"):
-                return None
-            return "break"
-
-        self.sysinfo_text.bind("<Key>", _summary_keypress)
-        self.sysinfo_text.bind("<Control-a>", lambda e: (
-            self.sysinfo_text.tag_add("sel", "1.0", "end-1c"), "break")[1])
-
-        sysinfo_menu = tk.Menu(self.sysinfo_text, tearoff=0)
-        sysinfo_menu.add_command(
-            label="Копировать выделенное",
-            command=lambda: self._copy_text_selection(self.sysinfo_text, self._copy_system_summary),
-        )
-        sysinfo_menu.add_command(label="Выделить всё", command=lambda: (
-            self.sysinfo_text.focus_set(),
-            self.sysinfo_text.tag_add("sel", "1.0", "end-1c")))
-        sysinfo_menu.add_separator()
-        sysinfo_menu.add_command(label="Копировать всё", command=self._copy_system_summary)
-
-        def _show_sysinfo_menu(event):
-            try:
-                sysinfo_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                sysinfo_menu.grab_release()
-
-        self.sysinfo_text.bind("<Button-3>", _show_sysinfo_menu)
+        self._bind_text_copy_support(self.sysinfo_text, self._copy_system_summary)
 
         threading.Thread(target=self._load_system_summary_async, daemon=True).start()
 
@@ -3403,7 +3599,16 @@ class CleanerApp:
             diag_row, text="проверка…", bg=DARK_BG, fg=DARK_FG_DIM,
             font=(APP_FONT, 9),
         )
-        self.diag_badge_label.pack(side="right")
+        # Иконка копирования — в шапке, как у "Системы". Пакуется
+        # первой справа, поэтому оказывается правее значка состояния.
+        self.copy_diag_btn = self._make_copy_icon(
+            diag_row, self._copy_diagnostics,
+            "Скопировать результат диагностики\n(или выделите нужное мышью и нажмите Ctrl+C)",
+        )
+        self.copy_diag_btn.pack(side="right")
+        self._set_copy_icon_enabled(self.copy_diag_btn, False)
+
+        self.diag_badge_label.pack(side="right", padx=(0, 8))
 
         self._bind_header_hover(
             diag_row,
@@ -3440,48 +3645,116 @@ class CleanerApp:
             "section", foreground=DARK_ETA_WARN, font=(APP_FONT, 9, "bold"), spacing1=4)
         self.diag_details_text.tag_configure(
             "problem", foreground=DARK_ETA_WARN)
-        self.diag_details_text.bind("<Key>", _summary_keypress)
-        self.diag_details_text.bind("<Control-a>", lambda e: (
-            self.diag_details_text.tag_add("sel", "1.0", "end-1c"), "break")[1])
+        # Выделение мышью, Ctrl+C, Ctrl+A и меню по правой кнопке —
+        # одним вызовом, одинаково для всех текстовых панелей.
+        self._bind_text_copy_support(self.diag_details_text, self._copy_diagnostics)
 
-        # Контекстное меню по правой кнопке — привычный способ
-        # скопировать выделенное, помимо Ctrl+C.
-        self.diag_menu = tk.Menu(self.diag_details_text, tearoff=0)
-        self.diag_menu.add_command(label="Копировать выделенное",
-                                   command=self._copy_diag_selection)
-        self.diag_menu.add_command(label="Выделить всё", command=lambda: (
-            self.diag_details_text.focus_set(),
-            self.diag_details_text.tag_add("sel", "1.0", "end-1c")))
-        self.diag_menu.add_separator()
-        self.diag_menu.add_command(label="Копировать всю диагностику",
-                                   command=self._copy_diagnostics)
-
-        def _show_diag_menu(event):
-            try:
-                self.diag_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                self.diag_menu.grab_release()
-
-        self.diag_details_text.bind("<Button-3>", _show_diag_menu)
-
-        # Кнопка копирования — внизу блока, под текстом: сверху она
-        # visually относилась к строке-заголовку, хотя копирует
-        # содержимое панели.
-        diag_actions_row = tk.Frame(self.diag_details_frame, bg=DARK_BG)
-        diag_actions_row.pack(fill="x", padx=2, pady=(4, 2))
-        self.copy_diag_btn = ttk.Button(
-            diag_actions_row, text="Копировать", width=14, command=self._copy_diagnostics,
-        )
-        self.copy_diag_btn.pack(side="left")
+        # Подсказка о способах копирования — под текстом, мелким
+        # шрифтом. Сама кнопка теперь в шапке блока.
         tk.Label(
-            diag_actions_row, text="или выделите мышью и нажмите Ctrl+C",
-            bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 8),
-        ).pack(side="left", padx=(10, 0))
+            self.diag_details_frame,
+            text="выделите нужное мышью и нажмите Ctrl+C, или ⧉ в шапке блока",
+            bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 8), anchor="w",
+        ).pack(fill="x", padx=10, pady=(4, 2))
 
         self._diag_expanded = False
         self._diag_text = ""
         self._diag_problems = []
         threading.Thread(target=self._load_hardware_diagnostics_async, daemon=True).start()
+
+        # ------------------------------------------------------------------
+        # Блок "Журнал событий" — история сбоев и перезагрузок.
+        #
+        # В отличие от диагностики железа (состояние "прямо сейчас",
+        # собирается автоматически) журнал отвечает на вопрос "что было
+        # за месяц" — это нужно, когда уже пришли разбираться с
+        # жалобой. Поэтому собирается ТОЛЬКО по кнопке: ни при запуске
+        # программы, ни при раскрытии блока. На слабых моноблоках
+        # (Pentium/Celeron) чтение журнала за 30 дней может занять до
+        # минуты, и запускать его без явного действия пользователя
+        # нельзя — иначе непонятно, почему программа "задумалась".
+        # ------------------------------------------------------------------
+        self.evlog_card = self._make_block(scroll_frame, BLOCK_ACCENTS["evlog"])
+        evlog_row = tk.Frame(self.evlog_card, bg=DARK_BG)
+        evlog_row.pack(fill="x", padx=10, pady=8)
+
+        self.evlog_toggle_btn = tk.Label(
+            evlog_row, text="▸", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 10, "bold"), cursor="hand2", padx=4,
+        )
+        self.evlog_toggle_btn.pack(side="left")
+        self.evlog_title_label = tk.Label(
+            evlog_row, text="📋  Журнал событий", bg=DARK_BG, fg=DARK_FG,
+            font=(APP_FONT, 11, "bold"), cursor="hand2",
+        )
+        self.evlog_title_label.pack(side="left", padx=(6, 0))
+        self.evlog_copy_btn = self._make_copy_icon(
+            evlog_row, self._copy_event_log,
+            "Скопировать журнал\n(или выделите нужное мышью и нажмите Ctrl+C)",
+        )
+        self.evlog_copy_btn.pack(side="right")
+        self._set_copy_icon_enabled(self.evlog_copy_btn, False)
+
+        self.evlog_badge_label = tk.Label(
+            evlog_row, text="не собран", bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 9),
+        )
+        self.evlog_badge_label.pack(side="right", padx=(0, 8))
+
+        self._bind_header_hover(
+            evlog_row,
+            (self.evlog_toggle_btn, self.evlog_title_label, self.evlog_badge_label),
+            self._toggle_evlog,
+        )
+
+        self.evlog_sep = tk.Frame(self.evlog_card, bg=DARK_BLOCK_BORDER, height=2)
+        self.evlog_body = tk.Frame(self.evlog_card, bg=DARK_BG)
+
+        evlog_text_wrap = tk.Frame(self.evlog_body, bg=DARK_BG)
+        evlog_text_wrap.pack(fill="both", expand=True, padx=10, pady=(8, 0))
+        evlog_scroll = ttk.Scrollbar(evlog_text_wrap, orient="vertical")
+        evlog_scroll.pack(side="right", fill="y")
+        self.evlog_text = tk.Text(
+            evlog_text_wrap, height=12, wrap="word", font=(APP_FONT, 9),
+            bg=DARK_ENTRY_BG, fg=DARK_FG, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=DARK_BORDER, insertwidth=0, cursor="xterm",
+            padx=8, pady=6,
+            selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
+            yscrollcommand=evlog_scroll.set,
+        )
+        self.evlog_text.pack(side="left", fill="both", expand=True)
+        evlog_scroll.configure(command=self.evlog_text.yview)
+        self.evlog_text.tag_configure(
+            "section", foreground=DARK_ETA_WARN, font=(APP_FONT, 9, "bold"), spacing1=4)
+        self.evlog_text.tag_configure("problem", foreground=DARK_ETA_WARN)
+        self._bind_text_copy_support(self.evlog_text, self._copy_event_log)
+        self._scroll_isolated_widgets.append(self.evlog_text)
+
+        # Внизу остаётся только кнопка сбора — копирование переехало в
+        # шапку блока, к иконке ⧉, как у остальных блоков.
+        evlog_actions = tk.Frame(self.evlog_body, bg=DARK_BG)
+        evlog_actions.pack(fill="x", padx=10, pady=(6, 8))
+        self.evlog_collect_btn = ttk.Button(
+            evlog_actions, text="Собрать", width=14, command=self._collect_event_log,
+        )
+        self.evlog_collect_btn.pack(side="left")
+        self.evlog_period_label = tk.Label(
+            evlog_actions, text="за последние 30 дней", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 8),
+        )
+        self.evlog_period_label.pack(side="left", padx=(10, 0))
+
+        self._evlog_expanded = False
+        self._evlog_text = ""
+        self._evlog_busy = False
+        self.evlog_text.insert(
+            "1.0",
+            "Журнал не собран.\n\n"
+            "Нажмите «Собрать» — программа прочитает журнал событий Windows\n"
+            "за последние 30 дней: некорректные выключения, синие экраны,\n"
+            "падения и зависания приложений, перезагрузки.\n\n"
+            "На современной машине занимает пару секунд, на слабом\n"
+            "моноблоке может потребоваться до минуты.",
+        )
 
         # ------------------------------------------------------------------
         # Блок 2: выбор и сами пункты выполнения. Заголовок "Выберите
@@ -3538,6 +3811,38 @@ class CleanerApp:
         )
         self.selection_summary_label.pack(side="right", padx=(0, 12))
 
+        # Строка поиска: 13 пунктов уже многовато, чтобы искать глазами.
+        # Фильтрует по названию и по описанию, поэтому находит и по
+        # смыслу — например "usb" покажет и энергосбережение портов.
+        search_row = tk.Frame(steps_block, bg=DARK_BG)
+        search_row.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Label(
+            search_row, text="🔍", bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 9),
+        ).pack(side="left", padx=(2, 6))
+
+        self.search_var = tk.StringVar()
+        self.search_entry = tk.Entry(
+            search_row, textvariable=self.search_var, bg=DARK_ENTRY_BG, fg=DARK_FG,
+            insertbackground=DARK_FG, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=DARK_BORDER, highlightcolor=DARK_ACCENT_BRIGHT,
+            font=(APP_FONT, 9),
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        self.search_var.trace_add("write", lambda *a: self._apply_step_filter())
+
+        self.search_clear_btn = tk.Label(
+            search_row, text="✕", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 9, "bold"), cursor="hand2", padx=8,
+        )
+        self.search_clear_btn.bind("<Button-1>", lambda e: self.search_var.set(""))
+        self.search_clear_btn.bind("<Enter>", lambda e: self.search_clear_btn.configure(fg=DARK_ETA_WARN))
+        self.search_clear_btn.bind("<Leave>", lambda e: self.search_clear_btn.configure(fg=DARK_FG_DIM))
+        # Показывается только когда в поле что-то введено.
+
+        self.search_empty_label = tk.Label(
+            steps_block, text="", bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 9),
+        )
+
         self._draw_master_box()
         self._update_selection_summary()
 
@@ -3577,11 +3882,15 @@ class CleanerApp:
             if step_id == "disable_services":
                 self.services_row = row
 
-            if idx < len(STEPS) - 1:
-                # Тонкий разделитель (1px) — той же толщины, что и
-                # вертикальные разделители у ETA внутри строки.
-                sep = tk.Frame(steps_frame, bg=DARK_BORDER, height=1)
-                sep.pack(fill="x")
+            # Разделитель под каждой строкой (включая последнюю) — так
+            # при фильтрации не остаётся "висящих" линий: разделитель
+            # прячется вместе со своей строкой.
+            sep = tk.Frame(steps_frame, bg=DARK_BORDER, height=1)
+            sep.pack(fill="x")
+            self._step_separators[step_id] = sep
+
+            # Текст для поиска: название + описание, в нижнем регистре.
+            self._step_search_text[step_id] = f"{title} {desc}".lower()
 
         # ------------------------------------------------------------------
         # Блок 3: основные действия — запуск всего отмеченного, отмена,
@@ -3700,18 +4009,30 @@ class CleanerApp:
         log_frame = tk.Frame(block4, bg=DARK_BG)
         log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
+        log_head = tk.Frame(log_frame, bg=DARK_BG)
+        log_head.pack(fill="x", pady=(0, 4))
         tk.Label(
-            log_frame, text="Ход выполнения", bg=DARK_BG, fg=DARK_FG_DIM,
+            log_head, text="Ход выполнения", bg=DARK_BG, fg=DARK_FG_DIM,
             font=(APP_FONT, 9, "bold"), anchor="w",
-        ).pack(anchor="w", pady=(0, 4))
+        ).pack(side="left")
+        self.copy_log_btn = self._make_copy_icon(
+            log_head, self._copy_run_log,
+            "Скопировать ход выполнения\n(или выделите нужное мышью и нажмите Ctrl+C)",
+        )
+        self.copy_log_btn.pack(side="right")
+        self._set_copy_icon_enabled(self.copy_log_btn, False)
 
         # Контейнер с рамкой того же цвета, что и рамки блоков — панель
         # журнала явно очерчена, а не висит на фоне.
         text_container = tk.Frame(log_frame, bg=DARK_BORDER)
         text_container.pack(fill="both", expand=True)
 
+        # state="disabled" здесь НЕ используется: он блокирует и
+        # выделение мышью, из-за чего ход выполнения нельзя было
+        # скопировать. Только для чтения виджет делает перехват клавиш
+        # в _bind_text_copy_support.
         self.log_text = tk.Text(
-            text_container, wrap="word", height=10, state="disabled",
+            text_container, wrap="word", height=10,
             bg=DARK_ENTRY_BG, fg=DARK_FG, insertbackground=DARK_FG,
             selectbackground=DARK_ACCENT, selectforeground=DARK_ACCENT_TEXT,
             relief="flat", borderwidth=0, highlightthickness=0,
@@ -3735,6 +4056,9 @@ class CleanerApp:
         self.log_text.tag_configure("summary_warn", foreground=DARK_ETA_WARN,
                                     font=(APP_FONT, 10, "bold"), spacing1=10)
         self.log_text.tag_configure("hint", foreground=DARK_FG_DIM, font=(APP_FONT, 9))
+
+        # Выделение мышью, Ctrl+C, Ctrl+A и меню по правой кнопке.
+        self._bind_text_copy_support(self.log_text, self._copy_run_log)
 
         # Колесо мыши над журналом листает журнал, а не всё окно —
         # тот же приём, что и у панели диагностики.
@@ -3834,6 +4158,7 @@ class CleanerApp:
 
         free_gb = round(total_gb - used_gb, 1)
         warn = percent >= 85
+        self._update_low_space_banner(percent, free_gb)
 
         # Полоса рисуется ДВУМЯ цветами: занятое — красным, свободное —
         # зелёным. Раньше свободная часть была просто пустым фоном, и на
@@ -3874,6 +4199,37 @@ class CleanerApp:
         self.disk_free_label.configure(text=f"свободно {free_gb} ГБ")
         self.disk_usage_label.configure(fg=DARK_ETA_WARN if warn else DARK_FG)
         self.disk_free_label.configure(fg=DARK_DISK_FREE if not warn else DARK_FG)
+
+    def _update_low_space_banner(self, percent, free_gb):
+        """
+        Показывает предупреждение, когда диск заполнен от 90%. Ниже
+        этого порога полосы и цифр достаточно, а вот на 90+ проблему
+        нужно не просто показать, а предложить решение — поэтому рядом
+        кнопка, запускающая только пункты очистки.
+        """
+        if not hasattr(self, "low_space_banner"):
+            return
+        if percent >= 90:
+            self.low_space_label.configure(
+                text=f"⚠  Критично мало места: свободно {free_gb} ГБ. "
+                     "Windows может не установить обновления и начнёт тормозить."
+            )
+            self.low_space_banner.pack(fill="x", pady=(6, 0))
+        else:
+            self.low_space_banner.pack_forget()
+
+    def _run_cleanup_only(self):
+        """
+        Запускает только пункты очистки — те, что реально освобождают
+        место. Настройки системы (электропитание, службы, USB) сюда не
+        входят: кнопка на баннере обещает освободить место, а не менять
+        конфигурацию машины.
+        """
+        cleanup_ids = ("clean_temp", "recycle_bin", "cleanmgr", "restore_points")
+        steps = [s for s in STEPS if s[0] in cleanup_ids]
+        if not steps:
+            return
+        self._start_run(steps)
 
     def _flash_disk_usage_row(self):
         """
@@ -3971,6 +4327,8 @@ class CleanerApp:
         """
         self._diag_text = text
         self._diag_problems = problems
+        # Диагностика собрана — копировать теперь есть что.
+        self._set_copy_icon_enabled(self.copy_diag_btn, True)
 
         # Название блока остаётся неизменным, результат — коротким
         # значком справа. Раньше итог дописывался в сам заголовок, и
@@ -3999,6 +4357,97 @@ class CleanerApp:
 
         self._draw_diag_toggle()
 
+    def _toggle_evlog(self, _event=None):
+        self._evlog_expanded = not self._evlog_expanded
+        if self._evlog_expanded:
+            self.evlog_sep.pack(fill="x")
+            self.evlog_body.pack(fill="x")
+            self.evlog_toggle_btn.configure(text="▾")
+            # Автосбор при раскрытии убран намеренно: на слабых машинах
+            # (Pentium/Celeron моноблоков) чтение журнала занимает
+            # заметное время, и раскрытие блока молча подвешивало бы
+            # интерфейс. Сбор запускается только кнопкой.
+        else:
+            self.evlog_body.pack_forget()
+            self.evlog_sep.pack_forget()
+            self.evlog_toggle_btn.configure(text="▸")
+
+    def _collect_event_log(self):
+        """
+        Запускает сбор журнала в фоновом потоке. Запрос к журналу
+        событий занимает пару секунд — в GUI-потоке это подвесило бы
+        окно.
+        """
+        if self._evlog_busy:
+            return
+        self._evlog_busy = True
+        # Кнопку копирования тоже блокируем: копировать пока нечего.
+        self.evlog_collect_btn.configure(state="disabled", text="Читаю…")
+        self._set_copy_icon_enabled(self.evlog_copy_btn, False)
+        self.evlog_badge_label.configure(text="⏳ чтение журнала…", fg=DARK_ETA_WARN)
+        self.evlog_text.delete("1.0", "end")
+        self.evlog_text.insert(
+            "1.0",
+            "Читаю журнал событий Windows…\n\n"
+            "На слабой машине это может занять до минуты — окно программы\n"
+            "остаётся отзывчивым, чтение идёт в фоне.",
+        )
+
+        def _work():
+            try:
+                text, problems = collect_event_log_summary(days=30)
+            except Exception as e:
+                text, problems = f"Не удалось прочитать журнал: {e}", []
+            self.root.after(0, lambda: self._apply_event_log(text, problems))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _apply_event_log(self, text, problems):
+        self._evlog_text = text
+        self._evlog_busy = False
+        self.evlog_collect_btn.configure(state="normal", text="Обновить")
+        self._set_copy_icon_enabled(self.evlog_copy_btn, True)
+
+        if problems:
+            word = "проблема" if len(problems) == 1 else (
+                "проблемы" if 2 <= len(problems) <= 4 else "проблем")
+            self.evlog_badge_label.configure(
+                text=f"⚠ {len(problems)} {word}", fg=DARK_ETA_WARN)
+        else:
+            self.evlog_badge_label.configure(text="✓ отклонений нет", fg="#7fbf7f")
+
+        self.evlog_text.delete("1.0", "end")
+        self.evlog_text.insert("1.0", text)
+        for idx, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("─") and stripped.endswith("─"):
+                self.evlog_text.tag_add("section", f"{idx}.0", f"{idx}.end")
+            elif stripped.startswith("!"):
+                self.evlog_text.tag_add("problem", f"{idx}.0", f"{idx}.end")
+
+    def _copy_event_log(self):
+        text = (self._evlog_text or "").strip()
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            return
+        self._flash_copy_icon(self.evlog_copy_btn)
+
+    def _copy_run_log(self):
+        """Кладёт весь ход выполнения в буфер обмена."""
+        text = self.log_text.get("1.0", "end-1c").strip()
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            return
+        self._flash_copy_icon(self.copy_log_btn)
+
     def _copy_text_selection(self, widget, fallback):
         """
         Копирует выделенное в переданном Text-виджете. Если ничего не
@@ -4018,9 +4467,6 @@ class CleanerApp:
         except Exception:
             pass
 
-    def _copy_diag_selection(self):
-        self._copy_text_selection(self.diag_details_text, self._copy_diagnostics)
-
     def _copy_diagnostics(self):
         """
         Кладёт весь результат диагностики железа в буфер обмена.
@@ -4035,8 +4481,7 @@ class CleanerApp:
             self.root.clipboard_append(text)
         except Exception:
             return
-        self.copy_diag_btn.configure(text="Скопировано")
-        self.root.after(1200, lambda: self.copy_diag_btn.configure(text="Копировать"))
+        self._flash_copy_icon(self.copy_diag_btn)
 
     def _draw_diag_toggle(self):
         # Стрелка в том же виде, что и у блока "Система" — отдельной
@@ -4089,6 +4534,99 @@ class CleanerApp:
 
         return inner
 
+    def _make_copy_icon(self, parent, command, tooltip):
+        """
+        Компактная кнопка копирования — значок вместо надписи
+        "Копировать" на всю ширину. Раньше такие кнопки стояли в разных
+        местах: у "Системы" в шапке блока, у диагностики и журнала —
+        внизу, под текстом. Теперь у всех блоков одинаковая иконка в
+        правом верхнем углу, рядом со значком состояния.
+
+        Возвращает сам виджет, чтобы вызывающий код мог менять его
+        состояние (например, блокировать, пока копировать нечего).
+        """
+        btn = tk.Label(
+            parent, text="⧉", bg=DARK_BG, fg=DARK_FG_DIM,
+            font=(APP_FONT, 12), cursor="hand2", padx=6, pady=1,
+        )
+        btn._sclean_enabled = True
+        btn._sclean_command = command
+
+        def _click(_e=None):
+            if btn._sclean_enabled:
+                btn._sclean_command()
+
+        def _enter(_e=None):
+            if btn._sclean_enabled:
+                btn.configure(fg=DARK_ETA_WARN)
+
+        def _leave(_e=None):
+            btn.configure(fg=DARK_FG_DIM if btn._sclean_enabled else DARK_BORDER)
+
+        btn.bind("<Button-1>", _click)
+        btn.bind("<Enter>", _enter)
+        btn.bind("<Leave>", _leave)
+        Tooltip(btn, tooltip)
+        return btn
+
+    def _set_copy_icon_enabled(self, btn, enabled):
+        """Включает/выключает кнопку-иконку копирования."""
+        btn._sclean_enabled = bool(enabled)
+        btn.configure(fg=DARK_FG_DIM if enabled else DARK_BORDER)
+
+    def _flash_copy_icon(self, btn):
+        """Короткое подтверждение копирования — галочка на секунду."""
+        btn.configure(text="✓", fg="#7fbf7f")
+        self.root.after(1000, lambda: btn.configure(
+            text="⧉", fg=DARK_FG_DIM if btn._sclean_enabled else DARK_BORDER))
+
+    def _bind_text_copy_support(self, widget, copy_all, extra_menu=None):
+        """
+        Включает у текстового виджета выделение мышью, Ctrl+C, Ctrl+A и
+        контекстное меню по правой кнопке. Один вызов вместо
+        копирования одних и тех же четырёх привязок по блокам —
+        раньше из-за этого у журнала событий не оказалось меню, а
+        журнал выполнения вообще не выделялся.
+        """
+        def _keypress(event):
+            # Пропускаем только копирование, выделение всего и
+            # перемещение курсора — виджет остаётся только для чтения.
+            if event.state & 0x4 and event.keysym.lower() in ("c", "a", "insert"):
+                return None
+            if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"):
+                return None
+            return "break"
+
+        widget.bind("<Key>", _keypress)
+        widget.bind("<Control-a>", lambda e: (
+            widget.tag_add("sel", "1.0", "end-1c"), "break")[1])
+
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(
+            label="Копировать выделенное",
+            command=lambda: self._copy_text_selection(widget, copy_all),
+        )
+        menu.add_command(label="Выделить всё", command=lambda: (
+            widget.focus_set(), widget.tag_add("sel", "1.0", "end-1c")))
+        menu.add_separator()
+        menu.add_command(label="Копировать всё", command=copy_all)
+        if extra_menu:
+            menu.add_separator()
+            for label, cmd in extra_menu:
+                menu.add_command(label=label, command=cmd)
+
+        def _popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", _popup)
+        # Ссылку на меню держим на виджете, иначе его соберёт сборщик
+        # мусора и правая кнопка перестанет работать.
+        widget._sclean_menu = menu
+        return menu
+
     def _bind_header_hover(self, row, children, on_click):
         """
         Делает шапку сворачиваемого блока кликабельной и подсвечивает её
@@ -4114,6 +4652,13 @@ class CleanerApp:
             w.bind("<Button-1>", lambda e: on_click())
             w.bind("<Enter>", _on)
             w.bind("<Leave>", _off)
+
+        # Кнопка-иконка копирования лежит в той же строке, но не должна
+        # сворачивать блок по клику — гасим всплытие события к строке.
+        for child in row.winfo_children():
+            if getattr(child, "_sclean_command", None) is not None:
+                child.bind("<Button-1>", lambda e, c=child: (c._sclean_command()
+                                                            if c._sclean_enabled else None) or "break")
 
     def _toggle_sysinfo(self, _event=None):
         """
@@ -4150,10 +4695,9 @@ class CleanerApp:
             self.root.clipboard_append(text)
         except Exception:
             return
-        # Короткая обратная связь на самой кнопке — окно с сообщением
+        # Короткая обратная связь на самой иконке — окно с сообщением
         # ради копирования строки было бы избыточным.
-        self.copy_summary_btn.configure(text="Скопировано")
-        self.root.after(1200, lambda: self.copy_summary_btn.configure(text="Копировать"))
+        self._flash_copy_icon(self.copy_summary_btn)
 
     def _toggle_services_panel(self, steps_frame):
         """
@@ -4298,6 +4842,52 @@ class CleanerApp:
         self._draw_master_box()
         self._update_selection_summary()
 
+    def _apply_step_filter(self):
+        """
+        Прячет строки, не подходящие под строку поиска. Ищет по
+        названию и описанию пункта, поэтому находит и по смыслу:
+        "usb" покажет энергосбережение портов, "диск" — очистку,
+        дефрагментацию и точки восстановления.
+
+        Скрытые пункты не снимаются с отметки: отфильтровали, отметили
+        нужное, очистили поиск — отмеченное осталось. Иначе фильтр
+        незаметно менял бы набор к выполнению.
+        """
+        query = self.search_var.get().strip().lower()
+
+        # Крестик очистки виден только когда есть что очищать.
+        if query:
+            self.search_clear_btn.pack(side="left")
+        else:
+            self.search_clear_btn.pack_forget()
+
+        shown = 0
+        for step_id, row in self.step_rows.items():
+            sep = self._step_separators.get(step_id)
+            match = not query or query in self._step_search_text.get(step_id, "")
+            if match:
+                shown += 1
+                row.pack(fill="x")
+                if sep is not None:
+                    sep.pack(fill="x")
+            else:
+                row.pack_forget()
+                if sep is not None:
+                    sep.pack_forget()
+            # Панель служб прячем вместе с её строкой, иначе она
+            # осталась бы висеть без заголовка.
+            if step_id == "disable_services" and self.services_panel is not None:
+                if match and self.services_panel_expanded:
+                    self.services_panel.pack(fill="x", after=self.services_row)
+                else:
+                    self.services_panel.pack_forget()
+
+        if query and shown == 0:
+            self.search_empty_label.configure(text=f"По запросу «{query}» ничего не найдено")
+            self.search_empty_label.pack(fill="x", padx=12, pady=8)
+        else:
+            self.search_empty_label.pack_forget()
+
     def _update_selection_summary(self):
         """
         Показывает, сколько пунктов отмечено и сколько времени они
@@ -4315,7 +4905,9 @@ class CleanerApp:
         total_sec = sum(STEP_ESTIMATED_SEC.get(sid) or 0 for sid in selected)
         word = "пункт" if len(selected) == 1 else (
             "пункта" if 2 <= len(selected) <= 4 else "пунктов")
-        text = f"отмечено {len(selected)} {word}  ·  ~{format_eta(total_sec)}"
+        # format_eta уже возвращает строку с "~" — вторую тильду здесь
+        # добавлять не нужно (была опечатка вида "~~34 мин").
+        text = f"отмечено {len(selected)} {word}  ·  {format_eta(total_sec)}"
         # Длинные наборы (от 5 минут) подсвечиваем тем же акцентом, что
         # и долгие пункты по отдельности.
         self.selection_summary_label.configure(
@@ -4342,7 +4934,6 @@ class CleanerApp:
         конце — используется при полном завершении выполнения, чтобы
         сразу было видно общий результат, не листая список пунктов.
         """
-        self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
 
         if not steps_to_run:
@@ -4354,7 +4945,6 @@ class CleanerApp:
                 "Здесь будет виден ход выполнения.",
                 "hint",
             )
-            self.log_text.configure(state="disabled")
             return
 
         icons = {"pending": "○", "running": "▶", "done": "✓", "error": "✗", "cancelled": "—"}
@@ -4385,10 +4975,12 @@ class CleanerApp:
                 tag = "summary"
             self.log_text.insert("end", summary + "\n", tag)
 
-        self.log_text.configure(state="disabled")
         # Прокручиваем к последней строке — при длинном списке важен
         # хвост (текущий пункт и итог), а не начало.
         self.log_text.see("end")
+        # Копировать есть что только когда список не пуст.
+        if hasattr(self, "copy_log_btn"):
+            self._set_copy_icon_enabled(self.copy_log_btn, bool(steps_to_run))
 
     def _check_update_background(self, silent):
         """
