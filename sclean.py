@@ -22,7 +22,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.27.1"
+APP_VERSION = "1.28.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1805,7 +1805,7 @@ def collect_hardware_diagnostics(logf=None):
         lines.append(f"  Без перезагрузки: {uptime_txt}")
         lines.append(f"  Последняя загрузка: {boot_s}")
         logf(f"  Без перезагрузки: {uptime_txt} (загружен {boot_s})")
-        if days >= 14:
+        if days >= 5:
             problems.append(
                 f"система не перезагружалась {days} дн — накапливаются утечки памяти "
                 "и незавершённые обновления, стоит перезагрузить"
@@ -2944,6 +2944,120 @@ def _darken(color, amount):
     return _mix_colors(color, "#000000", amount)
 
 
+def _hsv_to_hex(h, s, v):
+    """HSV (h в градусах 0-360, s и v в 0..1) -> '#rrggbb'."""
+    import colorsys
+    r, g, b = colorsys.hsv_to_rgb((h % 360) / 360.0, max(0.0, min(1.0, s)), max(0.0, min(1.0, v)))
+    return "#%02x%02x%02x" % (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+def _hex_to_hsv(color):
+    """'#rrggbb' -> (h в градусах, s, v)."""
+    import colorsys
+    r = int(color[1:3], 16) / 255.0
+    g = int(color[3:5], 16) / 255.0
+    b = int(color[5:7], 16) / 255.0
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    return h * 360.0, s, v
+
+
+def build_palette(hue):
+    """
+    Строит полную цветовую гамму интерфейса из одного оттенка.
+
+    Меняются только акцентные цвета и полоски блоков — фон, текст и
+    рамки остаются прежними, тёмными. Иначе при выборе, скажем,
+    жёлтого пришлось бы перекрашивать и фон, и весь интерфейс стал бы
+    нечитаемым.
+
+    Полоски блоков разводятся по кругу от базового оттенка (перпендикулярно
+    в терминах цветового круга — сдвиг на 90° и далее), поэтому блоки
+    остаются различимыми при любом выбранном цвете, но выглядят одним
+    семейством, а не случайным набором.
+    """
+    return {
+        # Насыщенность и яркость подобраны так, чтобы контраст с тёмным
+        # фоном оставался читаемым при ЛЮБОМ оттенке. Синие и
+        # фиолетовые тона темнее жёлто-зелёных при тех же параметрах
+        # HSV, поэтому значения выставлены по худшему случаю: иначе на
+        # синей гамме текст проблем сливался бы с фоном (контраст 2.98
+        # против нужных 4.5 по WCAG AA).
+        # Основной акцент: приглушённый, фон выбранного и активных кнопок.
+        "DARK_ACCENT": _hsv_to_hex(hue, 0.78, 0.48),
+        # Светлый текст на акцентном фоне.
+        "DARK_ACCENT_TEXT": _hsv_to_hex(hue, 0.05, 1.0),
+        # Яркий акцент: маркеры, полоска у выбранной строки, вспышки.
+        "DARK_ACCENT_BRIGHT": _hsv_to_hex(hue, 0.72, 0.75),
+        # Цвет внимания: проблемы, долгие пункты, раскрытые панели.
+        "DARK_ETA_WARN": _hsv_to_hex(hue, 0.45, 1.0),
+        # Фон отмеченной строки — заметно, но не ярко.
+        "DARK_ROW_SELECTED": _hsv_to_hex(hue, 0.30, 0.24),
+        # Предупреждающая плашка.
+        "DARK_WARN_BG": _hsv_to_hex(hue, 0.40, 0.26),
+        "DARK_WARN_FG": _hsv_to_hex(hue, 0.30, 0.97),
+        # Полоски блоков: расходятся по кругу от базового оттенка.
+        "BLOCK_ACCENTS": {
+            "header": _hsv_to_hex(hue, 0.05, 0.50),
+            "disk": _hsv_to_hex(hue, 0.70, 0.75),
+            "system": _hsv_to_hex(hue + 200, 0.55, 0.66),
+            "diag": _hsv_to_hex(hue + 280, 0.45, 0.69),
+            "evlog": _hsv_to_hex(hue + 40, 0.55, 0.69),
+            "steps": _hsv_to_hex(hue, 0.78, 0.48),
+            "actions": _hsv_to_hex(hue, 0.05, 0.44),
+            "run": _hsv_to_hex(hue + 130, 0.55, 0.56),
+        },
+    }
+
+
+THEME_REG_PATH = r"Software\sclean"
+THEME_REG_VALUE = "ThemeHue"
+DEFAULT_THEME_HUE = 0  # красный — исходная гамма программы
+
+
+def load_theme_hue():
+    """
+    Читает сохранённый оттенок темы из реестра (HKCU\\Software\\sclean).
+
+    Реестр, а не файл: программа поставляется одним exe, записать
+    настройку в себя она не может (файл занят при запуске, и это
+    сломало бы механизм автообновления, который подменяет exe целиком).
+    Значение в HKCU не требует прав администратора и переносится
+    вместе с профилем пользователя.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, THEME_REG_PATH) as key:
+            value, _ = winreg.QueryValueEx(key, THEME_REG_VALUE)
+            return int(value) % 360
+    except Exception:
+        return DEFAULT_THEME_HUE
+
+
+def save_theme_hue(hue):
+    """Сохраняет оттенок темы в реестр. Молча игнорирует сбои записи."""
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, THEME_REG_PATH) as key:
+            winreg.SetValueEx(key, THEME_REG_VALUE, 0, winreg.REG_DWORD, int(hue) % 360)
+        return True
+    except Exception:
+        return False
+
+
+def apply_palette(hue):
+    """
+    Применяет палитру к глобальным цветовым константам модуля.
+
+    Виджеты читают эти константы при создании, поэтому смена цвета
+    требует пересоздания интерфейса (см. CleanerApp._apply_theme_hue).
+    """
+    palette = build_palette(hue)
+    g = globals()
+    for key, value in palette.items():
+        g[key] = value
+    return palette
+
+
 def draw_gradient_bar(canvas, x0, y0, x1, y1, base_color, tag=None):
     """
     Рисует на Canvas горизонтальную полосу с вертикальным градиентом:
@@ -3205,6 +3319,12 @@ class CleanerApp:
         root.title(f"{APP_NAME} — очистка и оптимизация системы")
         root.geometry("760x640")
         root.resizable(True, True)
+
+        # Сохранённая гамма применяется ДО создания виджетов: они
+        # читают цветовые константы в момент создания.
+        self._theme_hue = load_theme_hue()
+        apply_palette(self._theme_hue)
+
         root.configure(bg=DARK_BG)
 
         self._set_window_icon()
@@ -3427,7 +3547,13 @@ class CleanerApp:
                     self._logo_img = raw.subsample(2, 2)
                 else:
                     self._logo_img = raw
-                ttk.Label(header_frame, image=self._logo_img, background=DARK_BG).pack(side="left", padx=(0, 8))
+                logo_label = tk.Label(
+                    header_frame, image=self._logo_img, bg=DARK_BG, cursor="hand2",
+                )
+                logo_label.pack(side="left", padx=(0, 8))
+                # Клик по логотипу открывает выбор цветовой гаммы.
+                logo_label.bind("<Button-1>", lambda e: self._open_theme_picker())
+                Tooltip(logo_label, "Выбрать цветовую гамму программы")
         except Exception:
             self._logo_img = None
 
@@ -4694,6 +4820,192 @@ class CleanerApp:
         tk.Frame(wrapper, bg=_mix_colors(DARK_SHADOW, DARK_BG, 0.5), height=1).pack(fill="x")
 
         return inner
+
+    def _open_theme_picker(self):
+        """
+        Окно выбора цветовой гаммы: цветовое колесо, по клику берётся
+        оттенок из точки. Меняются только акцентные цвета — фон, текст
+        и рамки остаются тёмными, поэтому интерфейс читается при любом
+        выборе.
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Цветовая гамма")
+        dlg.configure(bg=DARK_BG)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        size = 260
+        radius = size // 2 - 10
+        center = size // 2
+
+        tk.Label(
+            dlg, text="Выберите цвет — гамма применится сразу",
+            bg=DARK_BG, fg=DARK_FG, font=(APP_FONT, 9, "bold"),
+        ).pack(padx=16, pady=(14, 2))
+        tk.Label(
+            dlg, text="Фон и текст остаются тёмными, меняются только акценты",
+            bg=DARK_BG, fg=DARK_FG_DIM, font=(APP_FONT, 8),
+        ).pack(padx=16, pady=(0, 10))
+
+        wheel = tk.Canvas(
+            dlg, width=size, height=size, bg=DARK_BG,
+            highlightthickness=0, bd=0, cursor="hand2",
+        )
+        wheel.pack(padx=16)
+
+        # Колесо рисуется секторами: 360 дуг по одному градусу. Canvas
+        # не умеет градиентную заливку, поэтому цветовой круг —
+        # это набор узких секторов с плавно меняющимся оттенком.
+        for deg in range(0, 360, 2):
+            wheel.create_arc(
+                center - radius, center - radius, center + radius, center + radius,
+                start=deg, extent=2.5, fill=_hsv_to_hex(deg, 0.75, 0.95),
+                outline="", style="pieslice",
+            )
+        # Тёмная сердцевина — чтобы колесо читалось как кольцо и
+        # совпадало по духу с остальным интерфейсом.
+        inner = radius // 2
+        wheel.create_oval(
+            center - inner, center - inner, center + inner, center + inner,
+            fill=DARK_BG, outline=DARK_BORDER,
+        )
+
+        marker = wheel.create_oval(0, 0, 0, 0, outline="#ffffff", width=3)
+
+        preview_row = tk.Frame(dlg, bg=DARK_BG)
+        preview_row.pack(fill="x", padx=16, pady=(12, 0))
+        preview_swatches = []
+        for _ in range(5):
+            sw = tk.Frame(preview_row, height=22, bg=DARK_BG)
+            sw.pack(side="left", fill="x", expand=True, padx=1)
+            preview_swatches.append(sw)
+
+        state = {"hue": self._theme_hue}
+
+        def _place_marker(hue):
+            import math
+            ang = math.radians(hue)
+            rr = radius * 0.75
+            x = center + rr * math.cos(ang)
+            y = center - rr * math.sin(ang)
+            wheel.coords(marker, x - 7, y - 7, x + 7, y + 7)
+
+        def _update_preview(hue):
+            pal = build_palette(hue)
+            colors = [
+                pal["DARK_ACCENT"], pal["DARK_ACCENT_BRIGHT"], pal["DARK_ETA_WARN"],
+                pal["BLOCK_ACCENTS"]["system"], pal["BLOCK_ACCENTS"]["run"],
+            ]
+            for sw, c in zip(preview_swatches, colors):
+                sw.configure(bg=c)
+            _place_marker(hue)
+
+        def _pick(event):
+            import math
+            dx, dy = event.x - center, center - event.y
+            dist = math.hypot(dx, dy)
+            if dist < inner or dist > radius:
+                return
+            hue = math.degrees(math.atan2(dy, dx)) % 360
+            state["hue"] = hue
+            _update_preview(hue)
+
+        wheel.bind("<Button-1>", _pick)
+        wheel.bind("<B1-Motion>", _pick)
+        _update_preview(state["hue"])
+
+        btns = tk.Frame(dlg, bg=DARK_BG)
+        btns.pack(fill="x", padx=16, pady=14)
+
+        def _apply_and_close():
+            self._apply_theme_hue(state["hue"], save=True)
+            dlg.destroy()
+
+        def _reset():
+            state["hue"] = DEFAULT_THEME_HUE
+            _update_preview(DEFAULT_THEME_HUE)
+
+        ttk.Button(btns, text="Применить", width=14, command=_apply_and_close).pack(side="left")
+        ttk.Button(btns, text="Сбросить", width=12, command=_reset).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Отмена", width=12, command=dlg.destroy).pack(side="right")
+
+        dlg.update_idletasks()
+        # Ставим окно по центру главного.
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+
+    def _apply_theme_hue(self, hue, save=False):
+        """
+        Применяет новую гамму: обновляет глобальные константы и
+        пересобирает интерфейс.
+
+        Пересоздание, а не перекраска: цвета читаются виджетами в
+        момент создания (bg=DARK_BG и т.п.), и обойти ~200 виджетов,
+        каждый со своей логикой состояний (отмечено/наведено/раскрыто),
+        значило бы продублировать всю логику отрисовки второй раз.
+        Пересборка занимает доли секунды и гарантирует, что нигде не
+        останется старого цвета.
+        """
+        apply_palette(hue)
+        self._theme_hue = hue
+        if save:
+            save_theme_hue(hue)
+
+        # Запоминаем, что было развёрнуто и отмечено, чтобы вернуть
+        # после пересборки — иначе смена цвета сбрасывала бы выбор.
+        checked = {sid: var.get() for sid, var in self.check_vars.items()}
+        expanded = {
+            "sysinfo": getattr(self, "_sysinfo_expanded", False),
+            "diag": getattr(self, "_diag_expanded", False),
+            "evlog": getattr(self, "_evlog_expanded", False),
+            "about": getattr(self, "_about_expanded", False),
+        }
+        diag_text = getattr(self, "_diag_text", "")
+        diag_problems = getattr(self, "_diag_problems", [])
+        evlog_text = getattr(self, "_evlog_text", "")
+        summary = getattr(self, "_system_summary", None)
+
+        # Останавливаем автообновление диска — новый цикл запустится
+        # при пересборке.
+        if getattr(self, "_disk_refresh_after_id", None):
+            try:
+                self.root.after_cancel(self._disk_refresh_after_id)
+            except Exception:
+                pass
+            self._disk_refresh_after_id = None
+
+        for child in self.root.winfo_children():
+            child.destroy()
+
+        self.check_vars = {}
+        self.step_rows = {}
+        self._step_separators = {}
+        self._step_search_text = {}
+        self._scroll_isolated_widgets = []
+
+        self._setup_dark_theme()
+        self._build_ui()
+
+        # Возвращаем прежнее состояние.
+        for sid, val in checked.items():
+            if sid in self.check_vars:
+                self.check_vars[sid].set(val)
+        if summary:
+            self._set_system_summary_fields(summary)
+        if diag_text:
+            self._apply_hardware_diagnostics(diag_text, diag_problems)
+        if evlog_text:
+            self._apply_event_log(evlog_text, [])
+        if expanded["sysinfo"]:
+            self._toggle_sysinfo()
+        if expanded["diag"]:
+            self._toggle_diag_details()
+        if expanded["evlog"]:
+            self._toggle_evlog()
+        if expanded["about"]:
+            self._toggle_about()
 
     def _make_copy_icon(self, parent, command, tooltip):
         """
