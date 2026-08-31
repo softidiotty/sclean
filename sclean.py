@@ -22,7 +22,7 @@ from tkinter import ttk, messagebox
 # ============================================================
 
 APP_NAME = "sclean"
-APP_VERSION = "1.25.1"
+APP_VERSION = "1.27.0"
 APP_AUTHOR = "softidiotty"
 APP_FONT = "Segoe UI"
 
@@ -1965,6 +1965,159 @@ def collect_hardware_diagnostics(logf=None):
 
     lines.append("")
 
+    # --- Видеокарта: модель, память, драйвер, разрешение ---
+    # На моноблоках с iikoFront видеоядро обычно встроенное, и
+    # характерная проблема — не установленный драйвер: Windows ставит
+    # базовый видеоадаптер (Microsoft Basic Display Adapter), из-за
+    # чего интерфейс кассы тормозит и second display не подхватывается.
+    # Поэтому важна не столько модель, сколько факт наличия
+    # настоящего драйвера и его дата.
+    gpu_ps = (
+        "foreach ($g in @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue)) { "
+        "  $drvDate = ''; "
+        "  try { if ($g.DriverDate) { $drvDate = ([Management.ManagementDateTimeConverter]::"
+        "ToDateTime($g.DriverDate)).ToString('dd.MM.yyyy') } } catch {}; "
+        "  $vram = 0; "
+        "  try { $vram = [math]::Round($g.AdapterRAM / 1GB, 1) } catch {}; "
+        "  Write-Output \"$($g.Name)|$vram|$($g.DriverVersion)|$drvDate|"
+        "$($g.CurrentHorizontalResolution)|$($g.CurrentVerticalResolution)|$($g.CurrentRefreshRate)|"
+        "$($g.Status)\" "
+        "}"
+    )
+    gpu_out = run_ps(gpu_ps, timeout=60)
+
+    # Проблемные видеоустройства в диспетчере: Problem <> 0 означает
+    # код ошибки (43 — устройство остановлено, 31 — драйвер не
+    # запустился и т.п.). Отдельный запрос: Win32_VideoController
+    # такие устройства может вообще не показать.
+    pnp_ps = (
+        "foreach ($d in @(Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | "
+        "  Where-Object { $_.Status -ne 'OK' })) { "
+        "  Write-Output \"$($d.FriendlyName)|$($d.Status)|$($d.Problem)\" "
+        "}"
+    )
+    pnp_out = run_ps(pnp_ps, timeout=60)
+
+    # Число подключённых мониторов — для касс с покупательским
+    # дисплеем важно видеть, что второй экран на месте.
+    mon_ps = (
+        "try { @(Get-CimInstance -Namespace root/wmi -ClassName "
+        "WmiMonitorBasicDisplayParams -ErrorAction Stop).Count } catch { '' }"
+    )
+    mon_out = (run_ps(mon_ps, timeout=45) or "").strip()
+
+    lines.append("─ Видеокарта ─")
+    any_gpu = False
+    for line in (gpu_out or "").splitlines():
+        parts = [p.strip() for p in line.strip().split("|")]
+        if len(parts) < 4 or not parts[0]:
+            continue
+        parts += [""] * (8 - len(parts))
+        name, vram, drv_ver, drv_date, hres, vres, refresh, status = parts[:8]
+        any_gpu = True
+
+        lines.append(f"  {name}")
+
+        # Видеопамять: AdapterRAM врёт на современных картах (обрезается
+        # 4 ГБ из-за 32-битного поля), поэтому показываем только если
+        # значение осмысленное.
+        detail = []
+        try:
+            if vram and float(vram.replace(",", ".")) > 0:
+                detail.append(f"{vram} ГБ видеопамяти")
+        except ValueError:
+            pass
+        if hres and vres:
+            res_txt = f"{hres}×{vres}"
+            if refresh and refresh not in ("0", ""):
+                res_txt += f" @ {refresh} Гц"
+            detail.append(res_txt)
+        if detail:
+            lines.append("    " + "   ·   ".join(detail))
+
+        drv = []
+        if drv_ver:
+            drv.append(f"драйвер {drv_ver}")
+        if drv_date:
+            drv.append(f"от {drv_date}")
+        if drv:
+            lines.append("    " + ", ".join(drv))
+        logf(f"  Видеокарта: {name}, драйвер {drv_ver or 'н/д'}")
+
+        # Базовый видеоадаптер Microsoft означает, что родной драйвер
+        # не установлен — на кассе это прямая причина тормозов
+        # интерфейса и проблем со вторым монитором.
+        low_name = name.lower()
+        if "basic display" in low_name or "базовый видеоадаптер" in low_name:
+            problems.append(
+                "видеодрайвер не установлен (используется базовый адаптер Microsoft) — "
+                "интерфейс будет тормозить, второй монитор может не работать"
+            )
+        if status and status.lower() not in ("ok", "исправно"):
+            problems.append(f"видеокарта {name} сообщает о состоянии «{status}»")
+
+    if not any_gpu:
+        lines.append("  Получить сведения не удалось")
+        logf("  Видеокарта: получить сведения не удалось.")
+
+    # Мониторы
+    try:
+        mon_count = int(mon_out.splitlines()[-1].strip()) if mon_out else 0
+    except (ValueError, IndexError):
+        mon_count = 0
+    if mon_count:
+        word = "монитор" if mon_count == 1 else ("монитора" if mon_count < 5 else "мониторов")
+        lines.append(f"    Подключено: {mon_count} {word}")
+
+    # Видеоустройства с ошибкой в диспетчере устройств.
+    for line in (pnp_out or "").splitlines():
+        parts = [p.strip() for p in line.strip().split("|")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        dev_name, dev_status = parts[0], parts[1]
+        problem_code = parts[2] if len(parts) > 2 else ""
+        code_txt = f" (код {problem_code})" if problem_code and problem_code != "0" else ""
+        lines.append(f"  ⚠ {dev_name}: {dev_status}{code_txt}")
+        logf(f"  Видеоустройство с ошибкой: {dev_name} — {dev_status}")
+        problems.append(
+            f"видеоустройство «{dev_name}» не работает: {dev_status}{code_txt} — "
+            "переустановите драйвер"
+        )
+
+    # Сбои видеодрайвера за 7 дней: Event ID 4101 — "Display driver
+    # stopped responding and has recovered" (TDR). На кассе это
+    # проявляется морганием экрана и подвисаниями интерфейса. Пара
+    # событий за неделю — уже повод менять драйвер или смотреть
+    # охлаждение, поэтому проверяем отдельно от общего журнала.
+    tdr_ps = (
+        "try { "
+        "  $e = @(Get-WinEvent -FilterHashtable @{LogName='System'; ID=4101; "
+        "         StartTime=(Get-Date).AddDays(-7)} -ErrorAction Stop); "
+        "  Write-Output \"$($e.Count)|$(if ($e.Count -gt 0) "
+        "{ $e[0].TimeCreated.ToString('dd.MM.yyyy HH:mm') } else { '' })\" "
+        "} catch { Write-Output '0|' }"
+    )
+    tdr_out = run_ps(tdr_ps, timeout=60)
+    tdr_line = next((l.strip() for l in (tdr_out or "").splitlines() if "|" in l), "")
+    if tdr_line:
+        cnt_s, _, last_s = tdr_line.partition("|")
+        try:
+            tdr_count = int(cnt_s.strip())
+        except ValueError:
+            tdr_count = 0
+        if tdr_count:
+            suffix = f", последний раз {last_s.strip()}" if last_s.strip() else ""
+            lines.append(f"    Сбои драйвера за 7 дней: {tdr_count}{suffix}")
+            logf(f"  Сбоев видеодрайвера за 7 дней: {tdr_count}")
+            problems.append(
+                f"видеодрайвер за неделю сбоил {tdr_count} раз — экран моргает и "
+                "интерфейс подвисает; обновите драйвер и проверьте охлаждение"
+            )
+        else:
+            lines.append("    Сбоев драйвера за 7 дней: нет")
+
+    lines.append("")
+
     # --- Диски: здоровье, тип, температура ---
     disk_ps = (
         "foreach ($d in @(Get-PhysicalDisk -ErrorAction SilentlyContinue)) { "
@@ -2310,7 +2463,7 @@ def get_quick_system_summary():
     Один вызов PowerShell вместо нескольких отдельных — быстрее и не
     задерживает старт GUI сильнее необходимого (всё равно выполняется в
     фоновом потоке, см. CleanerApp._load_system_summary_async).
-    Возвращает словарь с ключами os/cpu/ram/board, значения — строки
+    Возвращает словарь с ключами os/build/cpu/ram/gpu/board, значения —
     "?" при неудаче отдельного запроса (не валит всю сводку целиком).
     """
     ps = (
@@ -2321,20 +2474,28 @@ def get_quick_system_summary():
         "-ErrorAction SilentlyContinue).UBR; "
         "$cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name; "
         "$ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1); "
+        # Видеокарт может быть несколько (встроенная + дискретная) —
+        # перечисляем все через запятую, как их видит система.
+        "$gpu = ((Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | "
+        "         ForEach-Object { $_.Name }) -join ', '); "
         "$boardMaker = (Get-CimInstance Win32_BaseBoard).Manufacturer; "
         "$boardModel = (Get-CimInstance Win32_BaseBoard).Product; "
-        "Write-Output ($os + '|' + $build + '.' + $ubr + '|' + $cpu + '|' + $ram + '|' + $boardMaker + ' ' + $boardModel)"
+        # Интерполяция вместо оператора "+": он в PowerShell ведёт себя
+        # по левому операнду, и при числе слева уходит в арифметику
+        # (эта ловушка уже ломала сбор данных о памяти).
+        "Write-Output \"$os|$build.$ubr|$cpu|$ram|$gpu|$boardMaker $boardModel\""
     )
-    out = run_ps(ps, timeout=15)
+    out = run_ps(ps, timeout=20)
     parts = (out or "").strip().split("|")
-    if len(parts) != 5:
-        return {"os": "?", "build": "?", "cpu": "?", "ram": "?", "board": "?"}
-    os_name, build, cpu, ram, board = (p.strip() for p in parts)
+    if len(parts) != 6:
+        return {"os": "?", "build": "?", "cpu": "?", "ram": "?", "gpu": "?", "board": "?"}
+    os_name, build, cpu, ram, gpu, board = (p.strip() for p in parts)
     return {
         "os": os_name or "?",
         "build": build or "?",
         "cpu": cpu or "?",
         "ram": f"{ram} ГБ" if ram else "?",
+        "gpu": gpu or "?",
         "board": board or "?",
     }
 
@@ -4287,7 +4448,7 @@ class CleanerApp:
     # чтобы порядок и названия не разъезжались между ними.
     SYSINFO_FIELDS = (
         ("os", "ОС"), ("build", "Сборка"), ("cpu", "Процессор"),
-        ("ram", "Память"), ("board", "Плата"),
+        ("ram", "Память"), ("gpu", "Видеокарта"), ("board", "Плата"),
     )
 
     def _set_system_summary_fields(self, summary):
